@@ -700,8 +700,9 @@ enum CredentialSanitizer {
         if let only = allSegments.first {
             if let eqIdx = only.firstIndex(of: "=") {
                 let left = String(only[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let knownOtherKeys: Set<String> = ["sessionid", "sid", "csrftoken", "csrf_token"]
-                    .union(cookieAttributeNames)
+                let knownOtherKeys = cookieAttributeNames.union([
+                    "sessionid", "sid", "csrftoken", "csrf_token"
+                ])
                 if knownOtherKeys.contains(left.lowercased()) {
                     return nil
                 }
