@@ -8,7 +8,7 @@
 - **原生 Liquid Glass**：在 `#if compiler(>=6.2)` 与 `#available(iOS 26.0, *)` 下直接调用 `GlassEffectContainer`、`.glassEffect(...)`、`.glassEffectID(_:in:)`、`.buttonStyle(.glass / .glassProminent)` 与 `.tabBarMinimizeBehavior(.onScrollDown)`，界面留白充足、不堆叠多余装饰。
 - **纯系统框架与严格并发**：仅使用 `Foundation`、`SwiftUI`、`UIKit`、`WebKit`、`Security`、`AVFoundation`、`PhotosUI`、`Vision`、`CoreImage`、`CoreGraphics`、`ImageIO`，全面启用 `SWIFT_STRICT_CONCURRENCY: complete`。
 - **账号接入与 Web 会话校验**：已移除微信二维码账号登录入口，专注手机号短信验证码登录（`PhoneLoginClient.swift` 对接官方 `/pc/login/send_sms_login_code/` 与 `/pc/login/verify_pwd_login/`，配合 `CaptchaSheet.swift` 腾讯防水墙交互式 `WKWebView` 验证）与手动凭据导入；网络层统一使用官方 Web 请求头（`X-Client: web`、`xtbz: ykt` 及同源 `Origin` / `Referer`，自动剥离旧 `desktop-v` 与 `Origin: file://`），并在短期课堂 `bearer` 过期时自动回退纯 Cookie 重试，同时兼容 Django 含 `expires=Tue, ... GMT` 日期逗号的多段 `Set-Cookie` 解析。
-- **签到扫码增强**：`CameraScannerSheet.swift` 支持双指缩放、快捷倍率切换、点击对焦及系统相册选图，配合 `QrImageDecoder.swift`（`Vision` 优先 + `CoreImage` 兜底）解码相册中的签到二维码。
+- **先选号、扫码即签（适配动态码）**：签到页采用「1. 多选签到账号 → 2. 扫码自动签到」流程；`CameraScannerSheet.swift` 支持双指缩放、快捷倍率切换、点击对焦与系统相册选图（`QrImageDecoder.swift` 以 `Vision` 优先、`CoreImage` 兜底），并在扫码器内实时提示已选账号数。实时扫码、相册识码或粘贴链接后会直接为已选的启用账号自动发起签到，减少动态二维码超时风险；同时对登录二维码、未知格式二维码与非受信任域名保持安全拦截，不自动触发签到请求。
 - **本地安全与脱敏导出**：账号凭据（Bearer / SessionID / CSRFToken）存入 Keychain（`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`），元信息开启文件保护并排除备份；签到结果 `SignResult` 通过显式 `CodingKeys` 排除任何凭据字段。
 
 ## 模块目录结构

@@ -6,6 +6,8 @@ import UIKit
 /// Full-screen AVFoundation QR scanner with serial queue isolation, pinch/preset zoom,
 /// tap-to-focus, photo library QR decoding, iPad orientation support, and Liquid Glass chrome.
 struct CameraScannerSheet: View {
+    let selectedAccountCount: Int?
+    let isDryRun: Bool
     let onScanned: (String) -> Void
     let onManualPaste: (() -> Void)?
 
@@ -17,11 +19,24 @@ struct CameraScannerSheet: View {
     @Namespace private var zoomGlassNamespace
 
     init(
+        selectedAccountCount: Int? = nil,
+        isDryRun: Bool = false,
         onScanned: @escaping (String) -> Void,
         onManualPaste: (() -> Void)? = nil
     ) {
+        self.selectedAccountCount = selectedAccountCount
+        self.isDryRun = isDryRun
         self.onScanned = onScanned
         self.onManualPaste = onManualPaste
+    }
+
+    private var scannerHintText: String {
+        if let count = selectedAccountCount, count > 0 {
+            return isDryRun
+                ? "对准签到二维码 · 演练 \(count) 个账号"
+                : "对准签到二维码 · 扫到即签 \(count) 个账号"
+        }
+        return "将雨课堂签到二维码置于框内"
     }
 
     var body: some View {
@@ -170,9 +185,12 @@ struct CameraScannerSheet: View {
 
                     LiquidGlassGroup(spacing: 12) {
                         VStack(spacing: 12) {
-                            Text("将雨课堂签到二维码置于框内")
+                            Text(scannerHintText)
                                 .font(.subheadline.weight(.medium))
+                                .monospacedDigit()
                                 .foregroundStyle(Color.white)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 10)
                                 .liquidGlassCapsule(interactive: false)
@@ -196,6 +214,7 @@ struct CameraScannerSheet: View {
                         }
                     }
                 }
+                .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
                 .padding(.bottom, 34)
             }
             .environment(\.colorScheme, .dark)

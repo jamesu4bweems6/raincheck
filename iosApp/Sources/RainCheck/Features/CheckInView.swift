@@ -17,7 +17,7 @@ struct CheckInView: View {
     }
 
     private var selectedEnabledCount: Int {
-        enabledAccounts.filter { store.selectedAccountIds.contains($0.id) }.count
+        store.selectedEnabledAccounts.count
     }
 
     private var allEnabledSelected: Bool {
@@ -27,6 +27,31 @@ struct CheckInView: View {
     private var canStartCheckIn: Bool {
         guard let ticket = store.currentTicket, ticket.kind != .login else { return false }
         return selectedEnabledCount > 0 && !store.isCheckingIn
+    }
+
+    private var latestSucceededCount: Int {
+        store.results.filter { $0.state.isSuccessLike }.count
+    }
+
+    private var latestFailedCount: Int {
+        store.results.filter { $0.state.isFailureLike }.count
+    }
+
+    private var latestIsDryRunBatch: Bool {
+        !store.results.isEmpty && store.results.allSatisfy { $0.state.isDryRun }
+    }
+
+    private func shouldShowResultSummary(for ticket: QrTicket) -> Bool {
+        !store.isCheckingIn && !store.results.isEmpty && store.lastBatchTicket?.raw == ticket.raw
+    }
+
+    private var scanHeroSubtitle: String {
+        if selectedEnabledCount > 0 {
+            return store.dryRun
+                ? "支持动态签到码，扫码或相册识码后将自动为已选的 \(selectedEnabledCount) 个账号执行演练。"
+                : "支持动态签到码，扫码或相册识码后将立即为已选的 \(selectedEnabledCount) 个账号自动签到。"
+        }
+        return "请先在上方勾选至少一个要签到的账号（支持多选），扫码后将自动执行签到。"
     }
 
     var body: some View {
@@ -40,15 +65,21 @@ struct CheckInView: View {
                             dryRunBanner
                         }
 
+                        accountSelectionSection
+
                         scanHeroCard
+
+                        if store.isCheckingIn {
+                            checkInProgressCard
+                        }
 
                         if let ticket = store.currentTicket {
                             ticketSummaryCard(ticket)
+
+                            if !store.isCheckingIn && canStartCheckIn {
+                                manualRerunButton
+                            }
                         }
-
-                        accountSelectionSection
-
-                        actionFooter
                     }
                     .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
                     .padding(.top, 14)
@@ -62,6 +93,7 @@ struct CheckInView: View {
                         Toggle(isOn: $store.dryRun) {
                             Label("演练模式", systemImage: "testtube.2")
                         }
+                        .disabled(store.isCheckingIn)
 
                         Button {
                             manualInputText = ""
@@ -69,6 +101,7 @@ struct CheckInView: View {
                         } label: {
                             Label("手动输入链接", systemImage: "keyboard")
                         }
+                        .disabled(store.isCheckingIn)
 
                         if store.currentTicket != nil {
                             Button {
@@ -76,6 +109,7 @@ struct CheckInView: View {
                             } label: {
                                 Label("清除当前二维码", systemImage: "xmark.circle")
                             }
+                            .disabled(store.isCheckingIn)
                         }
                     } label: {
                         Image(systemName: store.dryRun ? "testtube.2" : "ellipsis")
@@ -95,8 +129,10 @@ struct CheckInView: View {
                 }
             ) {
                 CameraScannerSheet(
+                    selectedAccountCount: selectedEnabledCount,
+                    isDryRun: store.dryRun,
                     onScanned: { raw in
-                        store.applyQrInput(raw)
+                        store.applyQrInput(raw, autoStartCheckIn: true)
                     },
                     onManualPaste: {
                         pendingManualPasteAfterScanner = true
@@ -106,8 +142,10 @@ struct CheckInView: View {
             .sheet(isPresented: $showManualInput) {
                 ManualLinkInputSheet(
                     text: $manualInputText,
+                    selectedAccountCount: selectedEnabledCount,
+                    isDryRun: store.dryRun,
                     onConfirm: { raw in
-                        store.applyQrInput(raw)
+                        store.applyQrInput(raw, autoStartCheckIn: true)
                     }
                 )
             }
@@ -137,6 +175,8 @@ struct CheckInView: View {
                     .contentShape(Capsule())
             }
             .buttonStyle(.plain)
+            .disabled(store.isCheckingIn)
+            .opacity(store.isCheckingIn ? 0.5 : 1.0)
             .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)
         }
@@ -174,40 +214,56 @@ struct CheckInView: View {
                     }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("扫描课堂二维码")
+                    Text(store.dryRun ? "2. 扫码自动演练" : "2. 扫码自动签到")
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(LiquidPalette.primaryText)
 
-                    Text("支持动态签到码与课堂链接，识别后由你确认再执行。")
+                    Text(scanHeroSubtitle)
                         .font(.subheadline)
                         .foregroundStyle(LiquidPalette.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
-            LiquidGlassGroup(spacing: 12) {
-                HStack(spacing: 12) {
-                    Button {
-                        showScanner = true
-                    } label: {
-                        Label("扫描二维码", systemImage: "qrcode.viewfinder")
-                    }
-                    .liquidPrimaryButtonStyle(
-                        minWidth: nil,
-                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
-                        fullWidth: true
-                    )
+            VStack(spacing: 10) {
+                LiquidGlassGroup(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Button {
+                            showScanner = true
+                        } label: {
+                            Label(
+                                store.dryRun ? "扫码自动演练" : "扫码自动签到",
+                                systemImage: "qrcode.viewfinder"
+                            )
+                            .minimumScaleFactor(0.76)
+                        }
+                        .liquidPrimaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: 14,
+                            fullWidth: true
+                        )
+                        .disabled(selectedEnabledCount == 0 || store.isCheckingIn)
 
-                    Button {
-                        handlePasteAction()
-                    } label: {
-                        Label("粘贴链接", systemImage: "doc.on.clipboard")
+                        Button {
+                            handlePasteAction()
+                        } label: {
+                            Label("粘贴链接", systemImage: "doc.on.clipboard")
+                        }
+                        .liquidSecondaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: 14,
+                            fullWidth: true
+                        )
+                        .disabled(store.isCheckingIn)
                     }
-                    .liquidSecondaryButtonStyle(
-                        minWidth: nil,
-                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
-                        fullWidth: true
-                    )
+                }
+
+                if selectedEnabledCount == 0 && !store.isCheckingIn {
+                    Text("请先在上方选择至少一个已启用账号")
+                        .font(.footnote)
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
                 }
             }
         }
@@ -246,6 +302,8 @@ struct CheckInView: View {
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .disabled(store.isCheckingIn)
+                .opacity(store.isCheckingIn ? 0.45 : 1.0)
                 .accessibilityLabel("清除当前二维码")
             }
 
@@ -307,7 +365,7 @@ struct CheckInView: View {
                         .foregroundStyle(LiquidPalette.primaryText)
                         .padding(.top, 1)
 
-                    Text("目标域名不在受信任白名单内，请核对二维码来源后再确认签到。")
+                    Text("目标域名不在受信任白名单内，已暂停自动签到，请核对二维码来源后再手动执行。")
                         .font(.footnote)
                         .foregroundStyle(LiquidPalette.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
@@ -325,9 +383,89 @@ struct CheckInView: View {
                         .allowsHitTesting(false)
                 }
             }
+
+            if shouldShowResultSummary(for: ticket) {
+                latestResultSummaryStrip
+            }
         }
         .padding(LiquidMetrics.cardPadding)
         .liquidGlassCard()
+    }
+
+    private var latestResultSummaryStrip: some View {
+        HStack(alignment: .center, spacing: 10) {
+            if latestIsDryRunBatch {
+                Image(systemName: "testtube.2")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(LiquidPalette.accent)
+
+                Text("演练完成 · 已模拟 \(store.results.count) 个账号")
+                    .font(.footnote.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.88)
+
+                Spacer(minLength: 0)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: latestFailedCount == 0 ? "checkmark.circle.fill" : "exclamationmark.circle")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(latestFailedCount == 0 ? LiquidPalette.accent : LiquidPalette.primaryText)
+
+                    Text("成功 \(latestSucceededCount) · 失败 \(latestFailedCount)")
+                        .font(.footnote.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(LiquidPalette.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.88)
+                }
+
+                Spacer(minLength: 8)
+
+                if latestFailedCount > 0 {
+                    Button {
+                        store.retryFailed()
+                    } label: {
+                        Text("重试失败项")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(LiquidPalette.accent)
+                            .lineLimit(1)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .frame(minWidth: 88, minHeight: 32)
+                            .background(
+                                LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                                in: Capsule()
+                            )
+                            .overlay {
+                                Capsule()
+                                    .strokeBorder(
+                                        LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                        lineWidth: 0.75
+                                    )
+                                    .allowsHitTesting(false)
+                            }
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LiquidPalette.subtleSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                .allowsHitTesting(false)
+        }
     }
 
     private func ticketMetaRow(label: String, value: String, monospaced: Bool = false) -> some View {
@@ -371,7 +509,7 @@ struct CheckInView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 LiquidSectionHeader(
-                    title: "参与账号",
+                    title: "1. 选择签到账号",
                     trailing: "已选 \(selectedEnabledCount) / \(enabledAccounts.count)"
                 )
 
@@ -401,6 +539,8 @@ struct CheckInView: View {
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                    .disabled(store.isCheckingIn)
+                    .opacity(store.isCheckingIn ? 0.5 : 1.0)
                     .fixedSize(horizontal: true, vertical: false)
                     .layoutPriority(1)
                 }
@@ -478,6 +618,8 @@ struct CheckInView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(store.isCheckingIn)
+                        .opacity(store.isCheckingIn ? 0.65 : 1.0)
 
                         if index < enabledAccounts.count - 1 {
                             Divider()
@@ -500,90 +642,65 @@ struct CheckInView: View {
         }
     }
 
-    private var actionFooterHint: String? {
-        guard !canStartCheckIn else { return nil }
-        guard let ticket = store.currentTicket else {
-            return "请先扫描或粘贴签到二维码"
+    private var checkInProgressCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                ProgressView()
+                    .tint(LiquidPalette.accent)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(store.dryRun ? "正在执行模拟演练" : "正在自动签到")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(LiquidPalette.primaryText)
+
+                    Text("进度 \(store.checkInCompletedCount) / \(max(store.checkInTotalCount, 1))")
+                        .font(.system(.caption, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("取消") {
+                    store.cancelCheckIn()
+                }
+                .liquidSecondaryButtonStyle(
+                    minWidth: 96,
+                    horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding
+                )
+            }
+
+            ProgressView(
+                value: Double(max(0, min(store.checkInCompletedCount, max(store.checkInTotalCount, 1)))),
+                total: Double(max(store.checkInTotalCount, 1))
+            )
+            .tint(LiquidPalette.accent)
         }
-        if ticket.kind == .login {
-            return "当前为登录二维码，请前往「账号」页添加账号"
-        }
-        if selectedEnabledCount == 0 {
-            return "请至少选择一个已启用账号"
-        }
-        return nil
+        .padding(LiquidMetrics.cardPadding)
+        .liquidGlassCard()
     }
 
-    @ViewBuilder
-    private var actionFooter: some View {
-        if store.isCheckingIn {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 14) {
-                    ProgressView()
-                        .tint(LiquidPalette.accent)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(store.dryRun ? "正在执行模拟演练" : "正在签到")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(LiquidPalette.primaryText)
-
-                        Text("进度 \(store.checkInCompletedCount) / \(max(store.checkInTotalCount, 1))")
-                            .font(.system(.caption, design: .monospaced))
-                            .monospacedDigit()
-                            .foregroundStyle(LiquidPalette.secondaryText)
-                    }
-
-                    Spacer(minLength: 8)
-
-                    Button("取消") {
-                        store.cancelCheckIn()
-                    }
-                    .liquidSecondaryButtonStyle(
-                        minWidth: 96,
-                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding
-                    )
-                }
-
-                ProgressView(
-                    value: Double(max(0, min(store.checkInCompletedCount, max(store.checkInTotalCount, 1)))),
-                    total: Double(max(store.checkInTotalCount, 1))
-                )
-                .tint(LiquidPalette.accent)
-            }
-            .padding(LiquidMetrics.cardPadding)
-            .liquidGlassCard()
-        } else {
-            VStack(spacing: 10) {
-                Button {
-                    store.startCheckIn()
-                } label: {
-                    Label(
-                        store.dryRun ? "开始模拟演练" : "开始签到",
-                        systemImage: store.dryRun ? "testtube.2" : "checkmark.circle.fill"
-                    )
-                }
-                .liquidPrimaryButtonStyle(
-                    minWidth: nil,
-                    horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
-                    fullWidth: true
-                )
-                .disabled(!canStartCheckIn)
-
-                if let hint = actionFooterHint {
-                    Text(hint)
-                        .font(.footnote)
-                        .foregroundStyle(LiquidPalette.secondaryText)
-                        .multilineTextAlignment(.center)
-                }
-            }
+    private var manualRerunButton: some View {
+        Button {
+            store.startCheckIn()
+        } label: {
+            Label(
+                store.dryRun ? "重新执行演练" : "重新为已选账号签到",
+                systemImage: store.dryRun ? "testtube.2" : "arrow.clockwise"
+            )
         }
+        .liquidSecondaryButtonStyle(
+            minWidth: nil,
+            horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+            fullWidth: true
+        )
     }
 
     private func handlePasteAction() {
         #if canImport(UIKit)
         let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !clipboard.isEmpty {
-            store.applyQrInput(clipboard)
+            store.applyQrInput(clipboard, autoStartCheckIn: true)
             return
         }
         #endif
@@ -603,6 +720,8 @@ struct CheckInView: View {
 
 private struct ManualLinkInputSheet: View {
     @Binding var text: String
+    let selectedAccountCount: Int
+    let isDryRun: Bool
     let onConfirm: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -612,15 +731,30 @@ private struct ManualLinkInputSheet: View {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var descriptionText: String {
+        if selectedAccountCount > 0 {
+            return isDryRun
+                ? "输入或粘贴雨课堂签到链接，确认后将为已选的 \(selectedAccountCount) 个账号自动执行演练。"
+                : "输入或粘贴雨课堂签到链接，确认后将为已选的 \(selectedAccountCount) 个账号自动签到。"
+        }
+        return "输入或粘贴雨课堂签到链接。当前尚未选择账号，识别后请先在签到页勾选要签到的账号。"
+    }
+
+    private var confirmButtonTitle: String {
+        guard selectedAccountCount > 0 else { return "识别链接" }
+        return isDryRun ? "识别并自动演练" : "识别并自动签到"
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 LiquidCanvas()
 
                 VStack(alignment: .leading, spacing: 18) {
-                    Text("剪贴板为空时，可在此直接输入或粘贴雨课堂签到链接。")
+                    Text(descriptionText)
                         .font(.subheadline)
                         .foregroundStyle(LiquidPalette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     TextField("粘贴或输入二维码内容", text: $text, axis: .vertical)
                         .lineLimit(3...6)
@@ -644,7 +778,7 @@ private struct ManualLinkInputSheet: View {
                                 onConfirm(trimmed)
                                 dismiss()
                             } label: {
-                                Label("识别链接", systemImage: "qrcode.viewfinder")
+                                Label(confirmButtonTitle, systemImage: "qrcode.viewfinder")
                             }
                             .liquidPrimaryButtonStyle(
                                 minWidth: nil,
@@ -685,7 +819,7 @@ private struct ManualLinkInputSheet: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("识别") {
+                    Button("确认") {
                         onConfirm(trimmed)
                         dismiss()
                     }

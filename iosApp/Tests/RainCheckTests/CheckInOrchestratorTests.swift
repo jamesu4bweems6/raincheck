@@ -1143,4 +1143,233 @@ final class CheckInOrchestratorTests: XCTestCase {
         // 4 个账号 staggerMs=50 -> 索引 3 目标延迟 150ms；留 50ms 调度余量断言 >= 100ms
         XCTAssertGreaterThanOrEqual(elapsedMs, 100, "超过并发上限的后续排队账号也应按索引应用 staggerMs 错峰延迟")
     }
+
+    // MARK: - Auto Check-In After QR Scan
+
+    @MainActor
+    func testApplyQrInputAutoStartChecksInOnlySelectedEnabledAccounts() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let seenAuths = LockedBox<[String]>([])
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            seenAuths.withLock { $0.append(auth) }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-2", label: "账号2", bearer: "tok-2"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-3", label: "账号3", bearer: "tok-3"))
+
+        // 3 个已启用账号中仅保留 2 个勾选（取消 acc-2）
+        store.toggleSelection(accountId: "acc-2")
+        XCTAssertEqual(store.selectedEnabledAccounts.map(\.id), ["acc-1", "acc-3"])
+
+        store.applyQrInput(
+            "https://www.yuketang.cn/api/v3/lesson/checkin?c=dyn99&t=1763900000&s=sig99&lessonId=5050",
+            autoStartCheckIn: true
+        )
+
+        XCTAssertTrue(store.isCheckingIn)
+        XCTAssertEqual(store.checkInTotalCount, 2)
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.dynamicCheckin)
+        XCTAssertEqual(store.lastBatchTicket, store.currentTicket)
+        XCTAssertEqual(store.toastMessage, "已识别签到码，正在为 2 个账号自动签到")
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(store.lastBatchTicket, store.currentTicket)
+        XCTAssertEqual(store.results.count, 2)
+        XCTAssertEqual(Set(store.results.map(\.accountId)), Set(["acc-1", "acc-3"]))
+        XCTAssertTrue(store.results.allSatisfy { $0.state == .success })
+        XCTAssertEqual(seenAuths.get().count, 2)
+        XCTAssertEqual(Set(seenAuths.get()), Set(["Bearer tok-1", "Bearer tok-3"]))
+        XCTAssertEqual(store.toastMessage, "签到完成：成功 2 / 2")
+    }
+
+    @MainActor
+    func testApplyQrInputAutoStartWhenNoAccountsSelectedKeepsTicketAndSkipsNetwork() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { _ in
+            requestCount.withLock { $0 += 1 }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-disabled", label: "停用账号", bearer: "tok-disabled", enabled: false))
+        store.toggleSelection(accountId: "acc-1")
+        XCTAssertTrue(store.selectedEnabledAccounts.isEmpty)
+
+        store.applyQrInput(
+            "https://www.yuketang.cn/api/v3/lesson/checkin?c=nosel&t=1763900000&s=sig&lessonId=6060",
+            autoStartCheckIn: true
+        )
+
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.dynamicCheckin)
+        XCTAssertEqual(store.currentTicket?.lessonId, "6060")
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertTrue(store.results.isEmpty)
+        XCTAssertEqual(store.toastMessage, "已识别签到码，请先选择至少一个已启用账号")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+    }
+
+    @MainActor
+    func testApplyQrInputAutoStartSkipsLoginUnknownAndUntrustedHost() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { _ in
+            requestCount.withLock { $0 += 1 }
+            return .json(200, #"{"code":0,"msg":"不应触发网络请求"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+
+        // 1) 登录码：不自动签到
+        store.applyQrInput(
+            "https://www.yuketang.cn/v/index/qrconnect?qrContent=login-demo-token",
+            autoStartCheckIn: true
+        )
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.login)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(
+            store.toastMessage,
+            "这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入"
+        )
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 2) 未知码：不自动签到
+        store.applyQrInput("hello-not-a-raincheck-qr", autoStartCheckIn: true)
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.unknown)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(store.toastMessage, "未识别为标准签到码，已暂停自动签到")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 3) 非受信任外部域名：不自动提交凭据
+        store.applyQrInput(
+            "https://evil.example/steal?c=bad1&t=1763900000&s=sig1&lessonId=7070",
+            autoStartCheckIn: true
+        )
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.dynamicCheckin)
+        XCTAssertFalse(store.isCurrentTicketHostTrusted())
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(store.toastMessage, "识别到非受信任域名，已暂停自动签到，请核对后再手动执行")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 4) 明文 HTTP 降级域名：同样视为非受信任并暂停自动签到
+        store.applyQrInput(
+            "http://www.yuketang.cn/api/v3/lesson/checkin?c=bad2&t=1763900000&s=sig2&lessonId=7071",
+            autoStartCheckIn: true
+        )
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.dynamicCheckin)
+        XCTAssertFalse(store.isCurrentTicketHostTrusted())
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(store.toastMessage, "识别到非受信任域名，已暂停自动签到，请核对后再手动执行")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertTrue(store.results.isEmpty)
+        XCTAssertEqual(requestCount.get(), 0)
+    }
+
+    @MainActor
+    func testApplyQrInputDefaultDoesNotAutoStartCheckIn() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { _ in
+            requestCount.withLock { $0 += 1 }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+
+        store.applyQrInput("https://www.yuketang.cn/api/v3/lesson/checkin?c=def1&t=1763900000&s=sig1&lessonId=8080")
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.dynamicCheckin)
+        XCTAssertTrue(store.isCurrentTicketHostTrusted())
+        XCTAssertEqual(store.selectedEnabledAccounts.count, 1)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(store.toastMessage, "已识别动态签到码")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        store.applyQrInput("lessonId=8081")
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.lessonOnly)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertNil(store.lastBatchTicket)
+        XCTAssertEqual(store.toastMessage, "已识别课堂签到目标")
+        XCTAssertEqual(requestCount.get(), 0)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+    }
+
+    @MainActor
+    func testApplyQrInputAutoStartGuardsInFlightBatchAndSupportsDryRun() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { _ in
+            requestCount.withLock { $0 += 1 }
+            return .json(200, #"{"code":0,"msg":"演练模式不应发起请求"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-2", label: "账号2", bearer: "tok-2"))
+        store.dryRun = true
+
+        store.applyQrInput("lessonId=9091", autoStartCheckIn: true)
+        XCTAssertTrue(store.isCheckingIn)
+        XCTAssertEqual(store.currentTicket?.kind, TicketKind.lessonOnly)
+        XCTAssertEqual(store.lastBatchTicket?.lessonId, "9091")
+        XCTAssertEqual(store.toastMessage, "已识别签到码，正在为 2 个账号演练签到")
+
+        // 签到进行中再次扫码：更新 currentTicket 但不打断进行中的批次
+        store.applyQrInput("lessonId=9092", autoStartCheckIn: true)
+        XCTAssertTrue(store.isCheckingIn)
+        XCTAssertEqual(store.currentTicket?.lessonId, "9092")
+        XCTAssertEqual(store.lastBatchTicket?.lessonId, "9091")
+        XCTAssertEqual(store.toastMessage, "当前正在签到中，已更新二维码，请稍后或取消后重试")
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(store.lastBatchTicket?.lessonId, "9091")
+        XCTAssertEqual(store.currentTicket?.lessonId, "9092")
+        XCTAssertEqual(store.results.count, 2)
+        XCTAssertTrue(store.results.allSatisfy { $0.state == .dryRun })
+        XCTAssertEqual(requestCount.get(), 0)
+    }
 }

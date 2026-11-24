@@ -58,8 +58,10 @@ final class AppStore: ObservableObject {
 
     // MARK: - Ticket Handling
 
-    /// 解析扫描或粘贴的二维码文本。绝不在扫描后自动触发签到，必须由用户显式确认。
-    func applyQrInput(_ raw: String) {
+    /// 解析扫描或粘贴的二维码文本。
+    /// 当 `autoStartCheckIn` 为 `true` 时，对受信任的标准签到码（动态码或课堂码）在已选账号非空且无进行中批次时立即自动触发签到；
+    /// 登录码、未知码、非受信任域名或默认 `false` 调用仅更新当前票据并提示，不自动发起签到请求。
+    func applyQrInput(_ raw: String, autoStartCheckIn: Bool = false) {
         let ticket = QrCodeParser.parse(raw, profile: profile)
         guard !ticket.raw.isEmpty else {
             showToast("未检测到有效二维码内容")
@@ -67,15 +69,45 @@ final class AppStore: ObservableObject {
         }
         currentTicket = ticket
 
+        guard autoStartCheckIn else {
+            switch ticket.kind {
+            case .dynamicCheckin:
+                showToast("已识别动态签到码")
+            case .lessonOnly:
+                showToast("已识别课堂签到目标")
+            case .login:
+                showToast("这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入")
+            case .unknown:
+                showToast("未识别为标准签到码")
+            }
+            return
+        }
+
         switch ticket.kind {
-        case .dynamicCheckin:
-            showToast("已识别动态签到码")
-        case .lessonOnly:
-            showToast("已识别课堂签到目标")
         case .login:
             showToast("这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入")
         case .unknown:
-            showToast("未识别为标准签到码")
+            showToast("未识别为标准签到码，已暂停自动签到")
+        case .dynamicCheckin, .lessonOnly:
+            if isCheckingIn {
+                showToast("当前正在签到中，已更新二维码，请稍后或取消后重试")
+                return
+            }
+            let targets = selectedEnabledAccounts
+            if targets.isEmpty {
+                showToast("已识别签到码，请先选择至少一个已启用账号")
+                return
+            }
+            if !isCurrentTicketHostTrusted() {
+                showToast("识别到非受信任域名，已暂停自动签到，请核对后再手动执行")
+                return
+            }
+            startCheckIn()
+            showToast(
+                dryRun
+                    ? "已识别签到码，正在为 \(targets.count) 个账号演练签到"
+                    : "已识别签到码，正在为 \(targets.count) 个账号自动签到"
+            )
         }
     }
 
@@ -101,6 +133,10 @@ final class AppStore: ObservableObject {
     }
 
     // MARK: - Selection
+
+    var selectedEnabledAccounts: [Account] {
+        accounts.filter { $0.enabled && selectedAccountIds.contains($0.id) }
+    }
 
     func toggleSelection(accountId: String) {
         if selectedAccountIds.contains(accountId) {
@@ -136,7 +172,7 @@ final class AppStore: ObservableObject {
             return
         }
 
-        let targets = accounts.filter { $0.enabled && selectedAccountIds.contains($0.id) }
+        let targets = selectedEnabledAccounts
         guard !targets.isEmpty else {
             showToast("请至少选择一个已启用账号")
             return
