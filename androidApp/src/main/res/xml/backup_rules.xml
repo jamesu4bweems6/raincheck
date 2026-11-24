@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- 显式排除所有加密凭据文件、旧版明文配置及导出报告 -->
+    <exclude domain="file" path="secure/" />
+    <exclude domain="file" path="." />
+    <exclude domain="sharedpref" path="raincheck.accounts.xml" />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="database" path="." />
+</full-backup-content>

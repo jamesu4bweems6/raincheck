@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="secure/" />
+        <exclude domain="file" path="." />
+        <exclude domain="sharedpref" path="raincheck.accounts.xml" />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+    </cloud-backup>
+    <!-- 阻止 Android 12+ 设备间直连迁移 (D2D) 导出凭据与敏感会话 -->
+    <device-transfer>
+        <exclude domain="file" path="secure/" />
+        <exclude domain="file" path="." />
+        <exclude domain="sharedpref" path="raincheck.accounts.xml" />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+    </device-transfer>
+</data-extraction-rules>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ExportOptions.plist —— 未来带证书导出 .ipa 时使用（当前 CI 走未签名路线，不读取本文件）。
+
+  用法（在 macOS 上，需自备开发者证书 + provisioning profile）：
+    xcodebuild -project RainCheck.xcodeproj -scheme RainCheck \
+      -configuration Release -sdk iphoneos -derivedDataPath build \
+      -archivePath build/RainCheck.xcarchive archive
+    xcodebuild -exportArchive \
+      -archivePath build/RainCheck.xcarchive \
+      -exportOptionsPlist ExportOptions.plist \
+      -exportPath build/export
+
+  signingStyle 固定 manual、signingCertificate / teamID / provisioningProfiles 留空，
+  表示「本仓库不内置任何证书信息」，需要签名时由使用者自行填写。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>development</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>signingCertificate</key>
+	<string></string>
+	<key>provisioningProfiles</key>
+	<dict/>
+	<key>teamID</key>
+	<string></string>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>destination</key>
+	<string>export</string>
+</dict>
+</plist>

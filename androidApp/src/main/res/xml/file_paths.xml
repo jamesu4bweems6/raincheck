@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 仅共享内部缓存目录中的脱敏排障报告 -->
+    <cache-path
+        name="reports"
+        path="reports/" />
+</paths>

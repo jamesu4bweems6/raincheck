@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Translucent frosted card container -->
+    <path
+        android:fillAlpha="0.20"
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M30,24h48a10,10 0 0,1 10,10v40a10,10 0 0,1 -10,10h-48a10,10 0 0,1 -10,-10v-40a10,10 0 0,1 10,-10z"
+        android:strokeAlpha="0.72"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2" />
+    <!-- QR finder corners -->
+    <path
+        android:fillColor="#FFF0FDFA"
+        android:pathData="M32,33h13v13h-13zM36,37v5h5v-5z" />
+    <path
+        android:fillColor="#FFF0FDFA"
+        android:pathData="M63,33h13v13h-13zM67,37v5h5v-5z" />
+    <path
+        android:fillColor="#FFF0FDFA"
+        android:pathData="M32,62h13v13h-13zM36,66v5h5v-5z" />
+    <!-- Checkmark accent badge -->
+    <path
+        android:fillColor="#FF2DD4BF"
+        android:pathData="M56,55h20a4,4 0 0,1 4,4v16a4,4 0 0,1 -4,4h-20a4,4 0 0,1 -4,-4v-16a4,4 0 0,1 4,-4z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,67.5l5,5l11,-11"
+        android:strokeColor="#FF052026"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="3.6" />
+</vector>

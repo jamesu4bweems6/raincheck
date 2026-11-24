@@ -1,0 +1,32 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+*.iml
+.idea/
+captures/
+.cxx/
+
+# Kotlin/Native
+.kotlin/
+
+# iOS / Xcode
+iosApp/*.xcodeproj/
+iosApp/build/
+iosApp/DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Python
+__pycache__/
+*.pyc
+tools/mock-server.log
+tools/demo.out.txt
+
+# 产物
+*.apk
+*.ipa
+*.aab
+*.hprof
+report*.json

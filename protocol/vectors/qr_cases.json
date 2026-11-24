@@ -1,0 +1,227 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "动态码 URL（带 lessonId）",
+      "raw": "https://www.yuketang.cn/api/v3/lesson/checkin?c=9f2c1a&t=1763900000&s=4b1d&v=2&lessonId=1529274209982060032",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "www.yuketang.cn",
+        "lessonId": "1529274209982060032",
+        "params": {
+          "c": "9f2c1a",
+          "t": "1763900000",
+          "s": "4b1d",
+          "v": "2",
+          "lessonId": "1529274209982060032"
+        }
+      }
+    },
+    {
+      "name": "动态码 纯 query 串",
+      "raw": "c=abc123&t=1763900000&s=deadbeef&v=2",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "params": {
+          "c": "abc123",
+          "t": "1763900000",
+          "s": "deadbeef",
+          "v": "2"
+        }
+      }
+    },
+    {
+      "name": "静态码 课堂链接（长江雨课堂）",
+      "raw": "https://changjiang.yuketang.cn/v2/web/studentLog/2876543?lessonId=1529274209982060032&classroomId=2876543",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "host": "changjiang.yuketang.cn",
+        "lessonId": "1529274209982060032",
+        "classroomId": "2876543"
+      }
+    },
+    {
+      "name": "荷塘雨课堂 Pro 动态码链接",
+      "raw": "https://pro.yuketang.cn/api/v3/lesson/checkin?c=ht2026&t=1763900123&s=sigpro&v=2&lesson_id=987654321",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "pro.yuketang.cn",
+        "lessonId": "987654321",
+        "params": {
+          "c": "ht2026",
+          "t": "1763900123",
+          "s": "sigpro",
+          "v": "2",
+          "lesson_id": "987654321"
+        }
+      }
+    },
+    {
+      "name": "黄河雨课堂 静态课堂链接",
+      "raw": "https://huanghe.yuketang.cn/v2/web/studentLog/991122?lid=55667788&cid=991122",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "host": "huanghe.yuketang.cn",
+        "lessonId": "55667788",
+        "classroomId": "991122"
+      }
+    },
+    {
+      "name": "学堂在线 课堂链接",
+      "raw": "https://www.xuetangx.com/v2/web/studentLog/334455?lessonId=77889900&classroomId=334455",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "host": "www.xuetangx.com",
+        "lessonId": "77889900",
+        "classroomId": "334455"
+      }
+    },
+    {
+      "name": "IPA 实证 app://yuketang 自定义 scheme 动态码",
+      "raw": "app://yuketang/checkin?c=appcode&t=1763900200&s=appsig&lessonId=20261124",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "yuketang",
+        "lessonId": "20261124",
+        "params": {
+          "c": "appcode",
+          "t": "1763900200",
+          "s": "appsig",
+          "lessonId": "20261124"
+        }
+      }
+    },
+    {
+      "name": "带端口 URL（本地演练环境）",
+      "raw": "http://127.0.0.1:8787/api/v3/lesson/checkin?c=mock01&t=1763900300&s=mocksig&v=2&lessonId=1529274209982060032",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "127.0.0.1:8787",
+        "lessonId": "1529274209982060032",
+        "params": {
+          "c": "mock01",
+          "t": "1763900300",
+          "s": "mocksig",
+          "v": "2",
+          "lessonId": "1529274209982060032"
+        }
+      }
+    },
+    {
+      "name": "含 #fragment 的动态码 URL（应剥离 fragment）",
+      "raw": "https://www.yuketang.cn/api/v3/lesson/checkin?c=frag01&t=1763900400&s=fragsig&lessonId=1529274209982060032#section-top",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "www.yuketang.cn",
+        "lessonId": "1529274209982060032",
+        "params": {
+          "c": "frag01",
+          "t": "1763900400",
+          "s": "fragsig",
+          "lessonId": "1529274209982060032"
+        }
+      }
+    },
+    {
+      "name": "URL 编码中文与字面量中文混合",
+      "raw": "https://www.yuketang.cn/x?c=a%2Bb&t=1763900500&s=%E4%B8%AD%E6%96%87+高数&v=2",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "www.yuketang.cn",
+        "params": {
+          "c": "a+b",
+          "t": "1763900500",
+          "s": "中文 高数",
+          "v": "2"
+        }
+      }
+    },
+    {
+      "name": "纯课堂号文本",
+      "raw": "1529274209982060032",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "lessonId": "1529274209982060032"
+      }
+    },
+    {
+      "name": "无 scheme 课堂链接",
+      "raw": "www.yuketang.cn/v2/web/studentLog/2876543?lessonId=1529274209982060032&classroomId=2876543",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "host": "www.yuketang.cn",
+        "lessonId": "1529274209982060032",
+        "classroomId": "2876543"
+      }
+    },
+    {
+      "name": "含 qrcode 路径的静态课堂链接（应判 LESSON_ONLY 而非 LOGIN）",
+      "raw": "https://www.yuketang.cn/v2/web/qrcode/checkin?lessonId=1529274209982060032&classroomId=2876543",
+      "expect": {
+        "kind": "LESSON_ONLY",
+        "host": "www.yuketang.cn",
+        "lessonId": "1529274209982060032",
+        "classroomId": "2876543"
+      }
+    },
+    {
+      "name": "IPv6 带端口 URL",
+      "raw": "http://[::1]:8787/api/v3/lesson/checkin?c=v6code&t=1763900600&s=v6sig&lessonId=666777",
+      "expect": {
+        "kind": "DYNAMIC_CHECKIN",
+        "host": "[::1]:8787",
+        "lessonId": "666777",
+        "params": {
+          "c": "v6code",
+          "t": "1763900600",
+          "s": "v6sig",
+          "lessonId": "666777"
+        }
+      }
+    },
+    {
+      "name": "登录二维码内容（含 login）",
+      "raw": "https://open.weixin.qq.com/connect/qrconnect?appid=wxb60db2584bf82ac1&redirect_uri=https%3A%2F%2Fwww.yuketang.cn%2Fapi%2Fv3%2Fuser%2Flogin%2Fwait-for-scan&state=login",
+      "expect": {
+        "kind": "LOGIN",
+        "host": "open.weixin.qq.com"
+      }
+    },
+    {
+      "name": "微信 qrconnect 登录二维码（不含 login 字样）",
+      "raw": "https://open.weixin.qq.com/connect/qrconnect?appid=wxb60db2584bf82ac1&redirect_uri=https%3A%2F%2Fpro.yuketang.cn%2Fcallback&state=abc987",
+      "expect": {
+        "kind": "LOGIN",
+        "host": "open.weixin.qq.com"
+      }
+    },
+    {
+      "name": "未知文本",
+      "raw": "hello-rain",
+      "expect": {
+        "kind": "UNKNOWN"
+      }
+    },
+    {
+      "name": "空串负向用例",
+      "raw": "",
+      "expect": {
+        "kind": "UNKNOWN"
+      }
+    },
+    {
+      "name": "纯空白负向用例",
+      "raw": "   \t\n  ",
+      "expect": {
+        "kind": "UNKNOWN"
+      }
+    },
+    {
+      "name": "非法 scheme 负向用例",
+      "raw": "ftp://evil.example/checkin?lessonId=1529274209982060032",
+      "expect": {
+        "kind": "UNKNOWN"
+      }
+    }
+  ]
+}

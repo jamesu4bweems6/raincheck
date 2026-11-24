@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "name": "yuketang",
+  "updatedAt": "2026-11-24",
+  "defaultEdition": "www",
+  "editions": [
+    { "id": "www", "label": "雨课堂", "host": "www.yuketang.cn" },
+    { "id": "pro", "label": "雨课堂 Pro（荷塘/专业版）", "host": "pro.yuketang.cn" },
+    { "id": "tsinghua", "label": "荷塘雨课堂", "host": "pro.yuketang.cn" },
+    { "id": "changjiang", "label": "长江雨课堂", "host": "changjiang.yuketang.cn" },
+    { "id": "huanghe", "label": "黄河雨课堂", "host": "huanghe.yuketang.cn" },
+    { "id": "xuetangx", "label": "学堂在线", "host": "www.xuetangx.com" },
+    { "id": "mock", "label": "本地演练环境", "host": "127.0.0.1:8787", "scheme": "http" }
+  ],
+  "headers": {
+    "xtbz": "ykt",
+    "desktop-v": "v2",
+    "X-Client": "desktop",
+    "Origin": "file://",
+    "Accept": "application/json, text/plain, */*"
+  },
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "auth": {
+    "bearerHeader": "Authorization",
+    "bearerPrefix": "Bearer ",
+    "cookieNames": ["sessionid", "csrftoken"],
+    "csrfCookie": "csrftoken",
+    "csrfHeader": "X-CSRFToken",
+    "tokenResponseHeaders": ["set-auth", "authorization"]
+  },
+  "endpoints": {
+    "me": {
+      "method": "GET",
+      "path": "/api/v3/user/basic-info",
+      "auth": true
+    },
+    "loginPre": {
+      "method": "GET",
+      "path": "/api/v3/user/login/pre-info",
+      "auth": false,
+      "note": "外部桌面端脚本推断，未经实网抓包验证"
+    },
+    "loginWait": {
+      "method": "POST",
+      "path": "/api/v3/user/login/wait-for-scan",
+      "body": { "token": "{loginToken}" },
+      "auth": false,
+      "note": "外部桌面端脚本推断，未经实网抓包验证"
+    },
+    "loginPoll": {
+      "method": "POST",
+      "path": "/api/v3/user/login",
+      "body": { "token": "{loginToken}" },
+      "auth": false,
+      "note": "外部桌面端脚本推断，未经实网抓包验证"
+    },
+    "loginCode": {
+      "method": "POST",
+      "path": "/api/v3/user/login/login-with-code",
+      "body": { "token": "{loginToken}", "code": "{code}" },
+      "auth": false,
+      "note": "外部桌面端脚本推断，未经实网抓包验证"
+    },
+    "activeLesson": {
+      "method": "GET",
+      "path": "/api/v3/classroom/on-lesson-upcoming-exam",
+      "auth": true
+    },
+    "checkinList": {
+      "method": "POST",
+      "path": "/api/v3/lesson/checkin-list",
+      "body": { "lesson_id": "{lessonId}", "page": 0, "limit": 20 },
+      "auth": true,
+      "note": "IPA 实证属教师端 remote_control POST 接口（postSignList），非学生端 GET"
+    },
+    "checkinDetail": {
+      "method": "POST",
+      "path": "/api/v3/lesson/checkin/detail",
+      "body": { "lesson_id": "{lessonId}", "checkin_id": "{checkinId}" },
+      "auth": true,
+      "note": "IPA 实证属教师端 remote_control POST 接口（postSignDetail），非学生端 GET"
+    },
+    "lessonBasic": {
+      "method": "GET",
+      "path": "/api/v3/lesson/basic-info",
+      "query": { "lesson_id": "{lessonId}" },
+      "auth": true,
+      "note": "IPA 实证查询参数名为 lesson_id"
+    },
+    "checkinTicket": {
+      "method": "POST",
+      "path": "/api/v3/lesson/checkin",
+      "body": {
+        "lessonId": "{lessonId}",
+        "source": "{source}",
+        "ticket": "{c}",
+        "t": "{t}",
+        "s": "{s}"
+      },
+      "auth": true,
+      "note": "路径获 IPA 实证；source/ticket/t/s 请求体由外部桌面端脚本推断"
+    },
+    "checkinDesktop": {
+      "method": "POST",
+      "path": "/api/v3/lesson/checkin",
+      "body": { "lessonId": "{lessonId}", "source": 1 },
+      "auth": true
+    },
+    "checkinWeb": {
+      "method": "POST",
+      "path": "/api/lesson/web_check_in",
+      "body": { "lessonId": "{lessonId}", "source": 1 },
+      "auth": true
+    },
+    "locationEligibility": {
+      "method": "GET",
+      "path": "/api/v3/lesson/location-checkin/eligibility",
+      "query": { "lessonId": "{lessonId}" },
+      "auth": true,
+      "note": "学生端定位签到资格查询（需登录态，尚未接入自动签到引擎）"
+    },
+    "locationPreview": {
+      "method": "GET",
+      "path": "/api/v3/lesson/location-checkin/preview",
+      "query": { "lessonId": "{lessonId}" },
+      "auth": true,
+      "note": "学生端定位签到预览（尚未接入自动签到引擎）"
+    },
+    "locationSession": {
+      "method": "POST",
+      "path": "/api/v3/lesson/location-checkin/session",
+      "body": { "lessonId": "{lessonId}" },
+      "auth": true,
+      "note": "IPA 实证属教师端创建定位签到会话接口（非学生端流程）"
+    },
+    "locationUpdateSession": {
+      "method": "POST",
+      "path": "/api/v3/location-checkin/update-session",
+      "body": { "lessonId": "{lessonId}" },
+      "auth": true,
+      "note": "IPA 实证教师端更新定位签到会话接口（路径不含 /lesson/，非学生端流程）"
+    },
+    "locationSubmit": {
+      "method": "POST",
+      "path": "/api/v3/lesson/location-checkin/submit",
+      "body": {
+        "lessonId": "{lessonId}",
+        "latitude": "{latitude}",
+        "longitude": "{longitude}",
+        "accuracy": "{accuracy}"
+      },
+      "auth": true,
+      "note": "学生端定位签到提交（尚未接入自动签到引擎）"
+    }
+  },
+  "strategies": [
+    {
+      "id": "DYN_TICKET_14",
+      "endpoint": "checkinTicket",
+      "appliesTo": ["DYNAMIC_CHECKIN"],
+      "requires": ["lessonId", "c"],
+      "vars": { "source": 14 },
+      "note": "PC/桌面端来源，公开实现里成功率最高（待实网验证）"
+    },
+    {
+      "id": "DYN_TICKET_5",
+      "endpoint": "checkinTicket",
+      "appliesTo": ["DYNAMIC_CHECKIN"],
+      "requires": ["lessonId", "c"],
+      "vars": { "source": 5 },
+      "note": "小程序来源，部分校区只认这个（待实网验证）"
+    },
+    {
+      "id": "LESSON_DESKTOP",
+      "endpoint": "checkinDesktop",
+      "appliesTo": ["DYNAMIC_CHECKIN", "LESSON_ONLY", "UNKNOWN"],
+      "requires": ["lessonId"],
+      "note": "静态码/课堂级签到，只要 lessonId"
+    },
+    {
+      "id": "LESSON_WEB",
+      "endpoint": "checkinWeb",
+      "appliesTo": ["LESSON_ONLY", "UNKNOWN"],
+      "requires": ["lessonId"],
+      "note": "网页端兜底"
+    },
+    {
+      "id": "QR_URL_POST",
+      "endpoint": null,
+      "appliesTo": ["DYNAMIC_CHECKIN"],
+      "requires": ["c"],
+      "note": "仅允许同源或白名单域名直接把二维码 URL POST 一次"
+    },
+    {
+      "id": "QR_URL_GET",
+      "endpoint": null,
+      "appliesTo": ["DYNAMIC_CHECKIN"],
+      "requires": ["c"],
+      "note": "仅允许同源或白名单域名把二维码 URL 原样 GET"
+    }
+  ],
+  "qr": {
+    "dynamicKeys": ["c", "t", "s"],
+    "lessonKeys": ["lessonId", "lesson_id", "lessonid", "lid"],
+    "classroomKeys": ["classroomId", "classroom_id", "classroomid", "cid"],
+    "checkinKeys": ["checkinId", "checkin_id", "signId", "sign_id"],
+    "loginPathHints": ["login", "qrcode", "scan", "qrconnect"],
+    "schemes": ["https", "http", "app", "yuketang", "ykt", "rainclassroom"],
+    "allowedUrlHosts": [
+      "www.yuketang.cn",
+      "pro.yuketang.cn",
+      "changjiang.yuketang.cn",
+      "huanghe.yuketang.cn",
+      "www.xuetangx.com",
+      "127.0.0.1:8787"
+    ]
+  },
+  "result": {
+    "codeField": "code",
+    "altCodeKeys": ["errcode"],
+    "okCodes": [0],
+    "messageFields": ["msg", "message"],
+    "altMessageKeys": ["errmsg"],
+    "alreadyKeywords": ["已签到", "已经签到", "重复签到", "已参与"],
+    "authKeywords": ["登录", "未授权", "身份", "token", "会话", "unauthorized"],
+    "expiredKeywords": ["失效", "过期", "不存在", "二维码已"],
+    "retryHttpStatus": [408, 425, 429, 500, 502, 503, 504]
+  }
+}
