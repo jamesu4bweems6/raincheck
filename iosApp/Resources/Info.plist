@@ -28,7 +28,7 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>需要相机权限来扫描课堂签到二维码；不授权也可以用「粘贴二维码」完成签到。</string>
+	<string>用于扫描雨课堂签到二维码；未授权相机时仍可通过粘贴链接完成签到。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

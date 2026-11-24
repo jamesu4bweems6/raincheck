@@ -1,25 +1,20 @@
-# XcodeGen 工程描述（iOS 端 · iOS 26/27 Liquid Glass）
+# RainCheck iOS 工程配置（XcodeGen）
 #
-# 用法（macOS 26 + Xcode 26/27，在 work/raincheck/iosApp 目录执行）：
-#   brew install xcodegen
+# 架构：纯系统框架（Foundation / SwiftUI / UIKit / Security / AVFoundation / CoreImage / CoreGraphics）
+# 规范：零第三方依赖 · Swift 5 严格并发（complete）· iOS 26/27 原生 Liquid Glass（iOS 16+ 优雅降级）· 默认完全未签名
+#
+# 常用命令（macOS，在 work/raincheck/iosApp 目录执行）：
 #   xcodegen generate
-#   # Apple Silicon Simulator 运行 XCTest 使用独立 derivedData 与零证书本地 Ad-Hoc 签名（避免 AMFI SIGKILL）
-#   xcodebuild -project RainCheck.xcodeproj -scheme RainCheck \
+#   # 1) iOS Simulator 运行 XCTest（独立 derivedData，使用本地零证书 Ad-Hoc 避免 Apple Silicon AMFI SIGKILL）
+#   xcodebuild test -project RainCheck.xcodeproj -scheme RainCheck \
 #     -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' \
 #     -derivedDataPath build-sim \
 #     CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO \
-#     CODE_SIGN_IDENTITY="-" AD_HOC_CODE_SIGNING_ALLOWED=YES test
-#   # 真机 Release 产物严格保持完全未签名（零证书、零 _CodeSignature）
-#   xcodebuild -project RainCheck.xcodeproj -scheme RainCheck \
+#     CODE_SIGN_IDENTITY="-" AD_HOC_CODE_SIGNING_ALLOWED=YES
+#   # 2) 真机 Release 构建（严格未签名：零证书、零 _CodeSignature、零 embedded.mobileprovision）
+#   xcodebuild build -project RainCheck.xcodeproj -scheme RainCheck \
 #     -configuration Release -sdk iphoneos -derivedDataPath build \
-#     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
-#
-# 设计约定：
-#   - 仅使用系统框架（Foundation / SwiftUI / UIKit / Security / AVFoundation / CoreImage / CoreGraphics），零第三方依赖；
-#   - 全程未签名（CODE_SIGNING_ALLOWED=NO），不依赖任何证书与 team；
-#   - Info.plist 显式启用 NSAppTransportSecurity.NSAllowsLocalNetworking = true，
-#     允许内置 mock (http://127.0.0.1:8787) 畅通，同时保持公网默认 ATS HTTPS 保护；
-#   - 包含真实 XCTest 单测靶标 RainCheckTests，直接加载 protocol/vectors/qr_cases.json 与 protocol/profile.json。
+#     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
 name: RainCheck
 
@@ -51,7 +46,7 @@ targets:
       path: Resources/Info.plist
       properties:
         CFBundleDisplayName: "雨课堂签到"
-        NSCameraUsageDescription: "需要相机权限来扫描课堂签到二维码；不授权也可以用「粘贴二维码」完成签到。"
+        NSCameraUsageDescription: "用于扫描雨课堂签到二维码；未授权相机时仍可通过粘贴链接完成签到。"
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         UILaunchScreen: {}
@@ -77,8 +72,6 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: "NO"
-
-        # 未签名构建：不需要证书、不需要 team
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
         CODE_SIGN_IDENTITY: ""

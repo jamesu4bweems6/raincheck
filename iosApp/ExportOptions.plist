@@ -1,35 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ExportOptions.plist —— 未来带证书导出 .ipa 时使用（当前 CI 走未签名路线，不读取本文件）。
+  ExportOptions.plist —— 可选自签名导出模板（适用于 Xcode 16 / 26）。
 
-  用法（在 macOS 上，需自备开发者证书 + provisioning profile）：
-    xcodebuild -project RainCheck.xcodeproj -scheme RainCheck \
+  默认未签名构建流程（含 CI）直接编译 Release iphoneos .app 并打包为未签名 .ipa，
+  不会读取本文件。如需使用个人 Apple Developer 证书导出已签名 .ipa，请自行填写
+  teamID、signingCertificate 与 provisioningProfiles 后执行：
+
+    xcodebuild archive -project RainCheck.xcodeproj -scheme RainCheck \
       -configuration Release -sdk iphoneos -derivedDataPath build \
-      -archivePath build/RainCheck.xcarchive archive
+      -archivePath build/RainCheck.xcarchive
     xcodebuild -exportArchive \
       -archivePath build/RainCheck.xcarchive \
       -exportOptionsPlist ExportOptions.plist \
       -exportPath build/export
-
-  signingStyle 固定 manual、signingCertificate / teamID / provisioningProfiles 留空，
-  表示「本仓库不内置任何证书信息」，需要签名时由使用者自行填写。
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>method</key>
-	<string>development</string>
-	<key>signingStyle</key>
-	<string>manual</string>
-	<key>signingCertificate</key>
-	<string></string>
-	<key>provisioningProfiles</key>
-	<dict/>
-	<key>teamID</key>
-	<string></string>
-	<key>stripSwiftSymbols</key>
-	<true/>
 	<key>destination</key>
 	<string>export</string>
+	<key>method</key>
+	<string>debugging</string>
+	<key>provisioningProfiles</key>
+	<dict/>
+	<key>signingCertificate</key>
+	<string></string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>teamID</key>
+	<string></string>
 </dict>
 </plist>
