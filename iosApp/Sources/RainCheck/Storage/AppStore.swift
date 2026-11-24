@@ -16,7 +16,6 @@ final class AppStore: ObservableObject {
     @Published var toastMessage: String?
 
     let profile: ProtocolProfile
-    let loginClient: QrLoginClient
     let phoneLoginClient: PhoneLoginClient
 
     private let vault: any AccountVaulting
@@ -38,7 +37,6 @@ final class AppStore: ObservableObject {
         let networkClient = RainCheckClient(session: session, profile: profile)
         self.client = networkClient
         self.orchestrator = CheckInOrchestrator(client: networkClient, profile: profile)
-        self.loginClient = QrLoginClient(session: session, profile: profile)
         self.phoneLoginClient = phoneLoginClient ?? PhoneLoginClient(session: session, profile: profile)
 
         let loadedAccounts = vault.load()
@@ -71,7 +69,7 @@ final class AppStore: ObservableObject {
         case .lessonOnly:
             showToast("已识别课堂签到目标")
         case .login:
-            showToast("这是登录二维码，请在账号页扫码登录")
+            showToast("这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入")
         case .unknown:
             showToast("未识别为标准签到码")
         }
@@ -130,7 +128,7 @@ final class AppStore: ObservableObject {
             return
         }
         if ticket.kind == .login {
-            showToast("这是登录二维码，请在账号页扫码登录")
+            showToast("这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入")
             return
         }
 
@@ -274,10 +272,17 @@ final class AppStore: ObservableObject {
         defer { verifyingAccountIds.remove(id) }
 
         do {
+            let snapshotHadBearer = !(snapshot.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             let verified = try await client.fetchMe(account: snapshot)
             // 安全合并：只更新仍存在的账号的凭据 / userId / lastOkAt，避免覆盖并发删除或编辑
             if let refreshed = verified.refreshedAccount {
-                applyRefreshedFields(from: refreshed, verifiedName: verified.name)
+                let refreshedHasBearer = !(refreshed.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                let staleBearerToClear = (snapshotHadBearer && !refreshedHasBearer) ? snapshot.bearer : nil
+                applyRefreshedFields(
+                    from: refreshed,
+                    verifiedName: verified.name,
+                    clearingStaleBearer: staleBearerToClear
+                )
             }
             let displayName = verified.name ?? accounts.first(where: { $0.id == id })?.label ?? snapshot.label
             showToast("验证通过：\(displayName)")
@@ -353,8 +358,12 @@ final class AppStore: ObservableObject {
     }
 
     /// 安全回填：只对当前仍存在于账号池中的账号合并凭据、`userId` 与 `lastOkAt`，
-    /// 绝不复活并发删除的账号，也不覆盖用户并发修改的备注、标签或启停开关。
-    private func applyRefreshedFields(from refreshed: Account, verifiedName: String?) {
+    /// 绝不复活并发删除的账号，也不覆盖用户并发修改的备注、自定义标签或启停开关。
+    private func applyRefreshedFields(
+        from refreshed: Account,
+        verifiedName: String?,
+        clearingStaleBearer: String? = nil
+    ) {
         guard let index = accounts.firstIndex(where: { $0.id == refreshed.id }) else {
             return
         }
@@ -365,6 +374,11 @@ final class AppStore: ObservableObject {
            !bearer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            bearer != current.bearer {
             current.bearer = bearer
+            changed = true
+        } else if let staleBearer = clearingStaleBearer,
+                  current.bearer == staleBearer,
+                  !(current.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+            current.bearer = nil
             changed = true
         }
         if let sessionId = refreshed.sessionId,
@@ -385,11 +399,12 @@ final class AppStore: ObservableObject {
             current.userId = userId
             changed = true
         }
-        if let verifiedName,
-           !verifiedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           current.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            current.label = verifiedName
-            changed = true
+        if let verifiedName {
+            let trimmedName = verifiedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedName.isEmpty && Account.isPlaceholderLabel(current.label) && current.label != trimmedName {
+                current.label = trimmedName
+                changed = true
+            }
         }
         if let okAt = refreshed.lastOkAt, okAt > (current.lastOkAt ?? 0) {
             current.lastOkAt = okAt

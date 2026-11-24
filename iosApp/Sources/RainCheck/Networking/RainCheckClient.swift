@@ -158,32 +158,53 @@ final class RainCheckClient: Sendable {
     }
 
     /// 校验账号会话并拉取用户基本信息（`me` 接口）。
+    /// 当账号同时持有短期 `bearer`（如课堂 `set-auth`）与长期 `sessionId` 且首次鉴权失败时，
+    /// 自动回退为纯 Cookie 重试一次；若回退成功则清空已过期的旧 `bearer`。
     func fetchMe(account: Account) async throws -> VerifiedProfile {
-        let result = await callEndpoint("me", account: account, variables: [:])
-        if result.isCancelled || Task.isCancelled {
+        let initialResult = await callEndpoint("me", account: account, variables: [:])
+        if initialResult.isCancelled || Task.isCancelled {
             throw CancellationError()
         }
-        if result.httpStatus == -1 {
-            throw RainCheckClientError.networkError(result.bodyText)
+
+        let hasBearer = !(account.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasSession = !(account.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        var activeAccount = account
+        var finalResult = initialResult
+
+        if !initialResult.ok && hasBearer && hasSession && isAuthFailure(initialResult) {
+            var cookieOnlyAccount = account
+            cookieOnlyAccount.bearer = nil
+            let retryResult = await callEndpoint("me", account: cookieOnlyAccount, variables: [:])
+            if retryResult.isCancelled || Task.isCancelled {
+                throw CancellationError()
+            }
+            if retryResult.ok {
+                activeAccount = cookieOnlyAccount
+            }
+            finalResult = retryResult
         }
-        if !result.ok {
-            let msg = result.message ?? "验证账号失败 (HTTP \(result.httpStatus))"
-            if result.httpStatus == 401 || result.httpStatus == 403
-                || matchesKeyword(msg, keywords: profile.result.authKeywords) {
+
+        if finalResult.httpStatus == -1 {
+            throw RainCheckClientError.networkError(finalResult.bodyText)
+        }
+        if !finalResult.ok {
+            let msg = finalResult.message ?? "验证账号失败 (HTTP \(finalResult.httpStatus))"
+            if isAuthFailure(finalResult) {
                 throw RainCheckClientError.authFailed(msg)
             }
             throw RainCheckClientError.invalidResponse(msg)
         }
 
-        let name = result.firstNonBlankDataString("name", "userName", "nickname", "username")
-        let userId = result.firstNonBlankDataString("id", "userId", "user_id")
+        let name = finalResult.firstNonBlankDataString("name", "userName", "nickname", "username")
+        let userId = finalResult.firstNonBlankDataString("id", "userId", "user_id")
 
-        var refreshed = result.authUpdate?.apply(to: account, markOk: true) ?? account
+        var refreshed = finalResult.authUpdate?.apply(to: activeAccount, markOk: true) ?? activeAccount
         refreshed.lastOkAt = RainCheckTime.nowMillis()
         if let userId {
             refreshed.userId = userId
         }
-        if let name, refreshed.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let name, Account.isPlaceholderLabel(refreshed.label) {
             refreshed.label = name
         }
 
@@ -345,12 +366,57 @@ final class RainCheckClient: Sendable {
         // 禁用系统共享 Cookie 池，彻底避免多账号并发串号或单测间污染
         request.httpShouldHandleCookies = false
 
+        let origin = Self.sameOrigin(for: url)
+        let normalizedHost = url.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let isXuetangX = normalizedHost.contains("xuetangx.com")
+        let defaultXtbz = isXuetangX ? "xt" : "ykt"
+
         if !profile.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             request.setValue(profile.userAgent, forHTTPHeaderField: "User-Agent")
         }
 
+        // 默认采用官方 Web 端请求头，避免历史 desktop-v / X-Client: desktop / Origin: file:// 导致 Web sessionid 401
+        request.setValue(defaultXtbz, forHTTPHeaderField: "xtbz")
+        request.setValue("web", forHTTPHeaderField: "X-Client")
+        if let origin {
+            request.setValue(origin, forHTTPHeaderField: "Origin")
+            request.setValue("\(origin)/v2/web/index", forHTTPHeaderField: "Referer")
+        }
+
         for (headerKey, headerValue) in profile.headers {
             if body != nil && headerKey.caseInsensitiveCompare("Content-Type") == .orderedSame {
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("desktop-v") == .orderedSame {
+                continue
+            }
+            let trimmedValue = headerValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if headerKey.caseInsensitiveCompare("X-Client") == .orderedSame {
+                let normalizedClient = (trimmedValue.isEmpty || trimmedValue.caseInsensitiveCompare("desktop") == .orderedSame)
+                    ? "web"
+                    : trimmedValue
+                request.setValue(normalizedClient, forHTTPHeaderField: "X-Client")
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("Origin") == .orderedSame {
+                if trimmedValue.isEmpty || trimmedValue.lowercased().hasPrefix("file://") {
+                    if let origin {
+                        request.setValue(origin, forHTTPHeaderField: "Origin")
+                    }
+                } else {
+                    request.setValue(trimmedValue, forHTTPHeaderField: "Origin")
+                }
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("Referer") == .orderedSame {
+                if !trimmedValue.isEmpty {
+                    request.setValue(trimmedValue, forHTTPHeaderField: "Referer")
+                }
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("xtbz") == .orderedSame {
+                let normalizedXtbz = isXuetangX ? "xt" : (trimmedValue.isEmpty ? "ykt" : trimmedValue)
+                request.setValue(normalizedXtbz, forHTTPHeaderField: "xtbz")
                 continue
             }
             request.setValue(headerValue, forHTTPHeaderField: headerKey)
@@ -364,6 +430,22 @@ final class RainCheckClient: Sendable {
 
         for (headerKey, headerValue) in extraHeaders {
             if body != nil && headerKey.caseInsensitiveCompare("Content-Type") == .orderedSame {
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("desktop-v") == .orderedSame {
+                continue
+            }
+            let trimmedValue = headerValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if headerKey.caseInsensitiveCompare("X-Client") == .orderedSame,
+               trimmedValue.caseInsensitiveCompare("desktop") == .orderedSame {
+                request.setValue("web", forHTTPHeaderField: "X-Client")
+                continue
+            }
+            if headerKey.caseInsensitiveCompare("Origin") == .orderedSame,
+               trimmedValue.lowercased().hasPrefix("file://") {
+                if let origin {
+                    request.setValue(origin, forHTTPHeaderField: "Origin")
+                }
                 continue
             }
             request.setValue(headerValue, forHTTPHeaderField: headerKey)
@@ -556,6 +638,7 @@ final class RainCheckClient: Sendable {
         var responseCookies: [String: String] = [:]
         var extractedSessionId: String?
         var extractedCsrf: String?
+        var rejectedCookieNames: Set<String> = []
 
         let parsedCookies = HTTPCookie.cookies(withResponseHeaderFields: stringHeaders, for: responseURL)
         let now = Date()
@@ -563,23 +646,46 @@ final class RainCheckClient: Sendable {
             if let maxAgeRaw = cookie.properties?[.maximumAge] as? String,
                let maxAge = Int(maxAgeRaw),
                maxAge <= 0 {
+                rejectedCookieNames.insert(cookie.name.lowercased())
                 continue
             }
             if let expires = cookie.expiresDate, expires <= now {
+                rejectedCookieNames.insert(cookie.name.lowercased())
                 continue
             }
             let cleanedValue = cookie.value
                 .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"")))
             if cleanedValue.isEmpty || cleanedValue.caseInsensitiveCompare("deleted") == .orderedSame {
+                rejectedCookieNames.insert(cookie.name.lowercased())
                 continue
             }
 
+            rejectedCookieNames.remove(cookie.name.lowercased())
             responseCookies[cookie.name] = cleanedValue
 
             if cookie.name.caseInsensitiveCompare(csrfCookieName) == .orderedSame {
                 extractedCsrf = cleanedValue
             } else if acceptedSessionNames.contains(where: { $0.caseInsensitiveCompare(cookie.name) == .orderedSame }) {
                 extractedSessionId = cleanedValue
+            }
+        }
+
+        // 兜底兼容逗号或分号拼接多条 Cookie 的 Set-Cookie 响应头（绝不误切 expires 日期中的逗号）
+        if let rawSetCookie = stringHeaders["Set-Cookie"] {
+            if extractedSessionId == nil {
+                for candidate in acceptedSessionNames where !rejectedCookieNames.contains(candidate.lowercased()) {
+                    if let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: candidate) {
+                        extractedSessionId = cleaned
+                        responseCookies[candidate] = cleaned
+                        break
+                    }
+                }
+            }
+            if extractedCsrf == nil,
+               !rejectedCookieNames.contains(csrfCookieName.lowercased()),
+               let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: csrfCookieName) {
+                extractedCsrf = cleaned
+                responseCookies[csrfCookieName] = cleaned
             }
         }
 
@@ -622,6 +728,41 @@ final class RainCheckClient: Sendable {
             return String(trimmed.dropFirst(trimmedPrefix.count + 1)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return trimmed
+    }
+
+    private static func sameOrigin(for url: URL) -> String? {
+        guard let scheme = url.scheme?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !scheme.isEmpty,
+              let host = url.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !host.isEmpty else {
+            return nil
+        }
+        let formattedHost = (host.contains(":") && !host.hasPrefix("[")) ? "[\(host)]" : host
+        if let port = url.port {
+            let isDefaultPort = (scheme == "https" && port == 443) || (scheme == "http" && port == 80)
+            if !isDefaultPort {
+                return "\(scheme)://\(formattedHost):\(port)"
+            }
+        }
+        return "\(scheme)://\(formattedHost)"
+    }
+
+    private func isAuthFailure(_ result: ApiCallResult) -> Bool {
+        if result.httpStatus == 401 || result.httpStatus == 403 {
+            return true
+        }
+        let trimmedMessage = result.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text = trimmedMessage.isEmpty ? result.bodyText : trimmedMessage
+        if matchesKeyword(text, keywords: profile.result.authKeywords) {
+            return true
+        }
+        if result.businessCode == 401 {
+            return true
+        }
+        if result.businessCode == 50000 && !(500...599).contains(result.httpStatus) {
+            return true
+        }
+        return false
     }
 
     private func matchesKeyword(_ text: String, keywords: [String]) -> Bool {

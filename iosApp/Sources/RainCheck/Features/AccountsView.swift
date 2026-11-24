@@ -1,14 +1,12 @@
 import SwiftUI
 
 private enum AccountSheetRoute: Identifiable {
-    case qrLogin
     case phoneLogin
     case manualCreate
     case manualEdit(Account)
 
     var id: String {
         switch self {
-        case .qrLogin: return "qr-login"
         case .phoneLogin: return "phone-login"
         case .manualCreate: return "manual-create"
         case .manualEdit(let account): return "manual-edit-\(account.id)"
@@ -42,12 +40,6 @@ struct AccountsView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
                         Button {
-                            activeSheet = .qrLogin
-                        } label: {
-                            Label("扫码登录", systemImage: "qrcode")
-                        }
-
-                        Button {
                             activeSheet = .phoneLogin
                         } label: {
                             Label("手机号验证码登录", systemImage: "iphone")
@@ -67,8 +59,6 @@ struct AccountsView: View {
             }
             .sheet(item: $activeSheet) { route in
                 switch route {
-                case .qrLogin:
-                    QrLoginSheet(store: store)
                 case .phoneLogin:
                     PhoneLoginSheet(store: store)
                 case .manualCreate:
@@ -85,26 +75,17 @@ struct AccountsView: View {
             LiquidEmptyState(
                 symbol: "person.crop.circle.badge.plus",
                 title: "还没有账号",
-                message: "通过微信扫码、手机号验证码或手动导入凭据，集中管理多个雨课堂账号。"
+                message: "点击右上角 + 或下方按钮，通过手机号验证码登录或手动导入凭据，集中管理多个雨课堂账号。"
             )
 
             LiquidGlassGroup(spacing: 12) {
                 VStack(spacing: 12) {
-                    HStack(spacing: 12) {
-                        Button {
-                            activeSheet = .qrLogin
-                        } label: {
-                            Label("扫码登录", systemImage: "qrcode")
-                        }
-                        .liquidPrimaryButtonStyle()
-
-                        Button {
-                            activeSheet = .phoneLogin
-                        } label: {
-                            Label("手机登录", systemImage: "iphone")
-                        }
-                        .liquidSecondaryButtonStyle()
+                    Button {
+                        activeSheet = .phoneLogin
+                    } label: {
+                        Label("手机号验证码登录", systemImage: "iphone")
                     }
+                    .liquidPrimaryButtonStyle()
 
                     Button {
                         activeSheet = .manualCreate

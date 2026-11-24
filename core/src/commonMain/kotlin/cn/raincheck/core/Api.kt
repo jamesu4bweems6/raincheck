@@ -144,20 +144,72 @@ class RainCheckApi(
         extraHeaders: Map<String, String>,
     ): ApiResult {
         val started = nowMillis()
+        val scheme = QrParser.extractScheme(url)
+        val rawHostPort = QrParser.extractHost(url)
+        val normalizedHostPort = when {
+            scheme == "https" && rawHostPort?.endsWith(":443") == true -> rawHostPort.removeSuffix(":443")
+            scheme == "http" && rawHostPort?.endsWith(":80") == true -> rawHostPort.removeSuffix(":80")
+            else -> rawHostPort
+        }
+        val origin = if (scheme != null && normalizedHostPort != null) "$scheme://$normalizedHostPort" else null
+        val isXuetangX = normalizedHostPort?.contains("xuetangx.com", ignoreCase = true) == true
+        val defaultXtbz = if (isXuetangX) "xt" else "ykt"
+
         val response: HttpResponse = try {
             client.request(url) {
                 this.method = HttpMethod.parse(method.uppercase())
                 profile.userAgent.takeIf { it.isNotBlank() }?.let { setUniqueHeader(HttpHeaders.UserAgent, it) }
+                // 默认采用官方 Web 端请求头，避免旧 Electron desktop-v / X-Client: desktop / Origin: file:// 导致 Web sessionid 401
+                setUniqueHeader("xtbz", defaultXtbz)
+                setUniqueHeader("X-Client", "web")
+                if (origin != null) {
+                    setUniqueHeader(HttpHeaders.Origin, origin)
+                    setUniqueHeader(HttpHeaders.Referrer, "$origin/v2/web/index")
+                }
                 profile.headers.forEach { (k, v) ->
-                    if (!(body != null && k.equals(HttpHeaders.ContentType, ignoreCase = true))) {
-                        setUniqueHeader(k, v)
+                    if (body != null && k.equals(HttpHeaders.ContentType, ignoreCase = true)) return@forEach
+                    if (k.equals("desktop-v", ignoreCase = true)) return@forEach
+                    val trimmed = v.trim()
+                    when {
+                        k.equals("X-Client", ignoreCase = true) -> {
+                            val normalizedClient = if (trimmed.isEmpty() || trimmed.equals("desktop", ignoreCase = true)) {
+                                "web"
+                            } else {
+                                trimmed
+                            }
+                            setUniqueHeader("X-Client", normalizedClient)
+                        }
+                        k.equals(HttpHeaders.Origin, ignoreCase = true) -> {
+                            if (trimmed.isEmpty() || trimmed.startsWith("file://", ignoreCase = true)) {
+                                if (origin != null) setUniqueHeader(HttpHeaders.Origin, origin)
+                            } else {
+                                setUniqueHeader(HttpHeaders.Origin, trimmed)
+                            }
+                        }
+                        k.equals(HttpHeaders.Referrer, ignoreCase = true) -> {
+                            if (trimmed.isNotEmpty()) setUniqueHeader(HttpHeaders.Referrer, trimmed)
+                        }
+                        k.equals("xtbz", ignoreCase = true) -> {
+                            val normalizedXtbz = if (isXuetangX) "xt" else trimmed.ifEmpty { "ykt" }
+                            setUniqueHeader("xtbz", normalizedXtbz)
+                        }
+                        else -> setUniqueHeader(k, v)
                     }
                 }
                 if (account != null) applyAuth(this, account)
                 referer?.takeIf { it.isNotBlank() }?.let { setUniqueHeader(HttpHeaders.Referrer, it) }
                 extraHeaders.forEach { (k, v) ->
-                    if (!(body != null && k.equals(HttpHeaders.ContentType, ignoreCase = true))) {
-                        setUniqueHeader(k, v)
+                    if (body != null && k.equals(HttpHeaders.ContentType, ignoreCase = true)) return@forEach
+                    if (k.equals("desktop-v", ignoreCase = true)) return@forEach
+                    val trimmed = v.trim()
+                    when {
+                        k.equals("X-Client", ignoreCase = true) && trimmed.equals("desktop", ignoreCase = true) -> {
+                            setUniqueHeader("X-Client", "web")
+                        }
+                        k.equals(HttpHeaders.Origin, ignoreCase = true) && trimmed.startsWith("file://", ignoreCase = true) -> {
+                            if (origin != null) setUniqueHeader(HttpHeaders.Origin, origin)
+                        }
+                        else -> setUniqueHeader(k, v)
                     }
                 }
                 if (body != null) {

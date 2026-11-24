@@ -460,6 +460,8 @@ final class PhoneLoginClient: Sendable {
                 continue
             }
 
+            rejectedCookieNames.remove(cookie.name.lowercased())
+
             if cookie.name.caseInsensitiveCompare(csrfCookieName) == .orderedSame {
                 extractedCsrf = cleanedValue
             } else if acceptedSessionNames.contains(where: { $0.caseInsensitiveCompare(cookie.name) == .orderedSame }) {
@@ -467,7 +469,7 @@ final class PhoneLoginClient: Sendable {
             }
         }
 
-        // 兜底兼容用分号拼接多个键值的 Set-Cookie 响应头（仅在未被判定过期/删除时启用）
+        // 兜底兼容逗号或分号拼接多条 Cookie（含 expires=Tue, 23-Nov-... 日期逗号）的 Set-Cookie 响应头
         if let rawSetCookie = stringHeaders["Set-Cookie"] {
             if extractedSessionId == nil {
                 for candidate in acceptedSessionNames where !rejectedCookieNames.contains(candidate.lowercased()) {

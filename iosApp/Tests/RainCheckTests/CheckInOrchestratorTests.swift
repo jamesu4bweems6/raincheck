@@ -610,4 +610,244 @@ final class CheckInOrchestratorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: reportURL) }
         XCTAssertTrue(FileManager.default.fileExists(atPath: reportURL.path))
     }
+
+    // MARK: - Cookie-Only Web Headers & Auth-Expired Classification Hardening
+
+    func testCookieOnlyCheckInSendsCleanWebHeadersAcrossEditionsAndEndpoints() async throws {
+        struct CapturedCheckInRequest: Sendable {
+            let path: String
+            let xClient: String?
+            let xtbz: String?
+            let origin: String?
+            let referer: String?
+            let desktopV: String?
+            let authorization: String?
+            let cookie: String?
+            let csrfHeader: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+
+        // 验证协议配置与内置兜底均已切换为纯 Web 请求头
+        XCTAssertEqual(profile.headers["X-Client"], "web")
+        XCTAssertEqual(profile.headers["xtbz"], "ykt")
+        XCTAssertNil(profile.headers["desktop-v"])
+        XCTAssertNil(profile.headers["Origin"])
+        XCTAssertEqual(ProtocolCatalog.fallback.headers["X-Client"], "web")
+        XCTAssertEqual(ProtocolCatalog.fallback.headers["xtbz"], "ykt")
+        XCTAssertNil(ProtocolCatalog.fallback.headers["desktop-v"])
+        XCTAssertNil(ProtocolCatalog.fallback.headers["Origin"])
+
+        let editionIds = ["www", "pro", "changjiang", "huanghe", "mock"]
+        for editionId in editionIds {
+            let edition = try XCTUnwrap(profile.edition(editionId), "profile 应包含站点 \(editionId)")
+            let expectedOrigin = "\(edition.scheme)://\(edition.host)"
+            let captured = LockedBox<[CapturedCheckInRequest]>([])
+
+            let orchestrator = makeOrchestrator(profile: profile) { request in
+                let path = request.url?.path ?? ""
+                captured.withLock {
+                    $0.append(
+                        CapturedCheckInRequest(
+                            path: path,
+                            xClient: MockNetworkSupport.headerValue("X-Client", in: request),
+                            xtbz: MockNetworkSupport.headerValue("xtbz", in: request),
+                            origin: MockNetworkSupport.headerValue("Origin", in: request),
+                            referer: MockNetworkSupport.headerValue("Referer", in: request),
+                            desktopV: MockNetworkSupport.headerValue("desktop-v", in: request),
+                            authorization: MockNetworkSupport.headerValue("Authorization", in: request),
+                            cookie: MockNetworkSupport.headerValue("Cookie", in: request),
+                            csrfHeader: MockNetworkSupport.headerValue("X-CSRFToken", in: request)
+                        )
+                    )
+                }
+
+                if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                    return .json(
+                        200,
+                        #"{"code":0,"msg":"","data":{"onLessonClassrooms":[{"lessonId":"555","classroomId":"666","courseName":"高等数学"}]}}"#
+                    )
+                }
+                if path == "/api/v3/lesson/checkin" {
+                    let source = MockNetworkSupport.requestBodyJSON(from: request)?["source"]?.intValue
+                    if source == 14 || source == 5 {
+                        return .json(200, #"{"code":40002,"msg":"尝试课堂级签到"}"#)
+                    }
+                    if source == 1 {
+                        return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+                    }
+                }
+                return .json(404, #"{"code":40400}"#)
+            }
+
+            let cookieOnlyAccount = makeAccount(
+                id: "cookie-acc-\(editionId)",
+                label: "纯Cookie用户",
+                host: edition.host,
+                scheme: edition.scheme,
+                bearer: nil,
+                sessionId: "web-sid-\(editionId)",
+                csrfToken: "web-csrf-\(editionId)"
+            )
+            // 无 lessonId 动态码：覆盖 activeLesson -> checkinTicket(14) -> checkinTicket(5) -> checkinDesktop(1)
+            let ticket = QrCodeParser.parse("c=webcode1&t=1763900000&s=websig1&v=2", profile: profile)
+            let result = await orchestrator.checkIn(account: cookieOnlyAccount, ticket: ticket)
+
+            XCTAssertEqual(result.state, .success, "\(editionId) 纯 Cookie 签到应成功")
+            XCTAssertEqual(result.strategyId, "LESSON_DESKTOP")
+
+            let requests = captured.get()
+            XCTAssertEqual(requests.count, 4, "\(editionId) 应覆盖 activeLesson + DYN_TICKET_14 + DYN_TICKET_5 + LESSON_DESKTOP")
+            for req in requests {
+                XCTAssertEqual(req.xClient, "web", "\(editionId) \(req.path) 必须发送 X-Client: web")
+                XCTAssertEqual(req.xtbz, "ykt", "\(editionId) \(req.path) 必须发送 xtbz: ykt")
+                XCTAssertEqual(req.origin, expectedOrigin, "\(editionId) \(req.path) Origin 必须同源")
+                XCTAssertNotEqual(req.origin, "file://", "\(editionId) \(req.path) 绝不可发送 Origin: file://")
+                XCTAssertNil(req.desktopV, "\(editionId) \(req.path) 绝不可发送 desktop-v")
+                XCTAssertNil(req.authorization, "\(editionId) \(req.path) 纯 Cookie 账号不应发送 Authorization")
+                XCTAssertTrue(req.cookie?.contains("sessionid=web-sid-\(editionId)") == true)
+                XCTAssertTrue(req.cookie?.contains("csrftoken=web-csrf-\(editionId)") == true)
+                XCTAssertEqual(req.csrfHeader, "web-csrf-\(editionId)")
+
+                if req.path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                    XCTAssertEqual(req.referer, "\(expectedOrigin)/v2/web/index")
+                } else {
+                    XCTAssertEqual(req.referer, "\(expectedOrigin)/v2/web/studentLog/666")
+                }
+                XCTAssertTrue(req.referer?.hasPrefix("\(expectedOrigin)/v2/web/") == true)
+            }
+        }
+
+        // 覆盖 LESSON_WEB (/api/lesson/web_check_in) 纯 Cookie 请求头
+        let webFallbackCaptured = LockedBox<[CapturedCheckInRequest]>([])
+        let webOrch = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            webFallbackCaptured.withLock {
+                $0.append(
+                    CapturedCheckInRequest(
+                        path: path,
+                        xClient: MockNetworkSupport.headerValue("X-Client", in: request),
+                        xtbz: MockNetworkSupport.headerValue("xtbz", in: request),
+                        origin: MockNetworkSupport.headerValue("Origin", in: request),
+                        referer: MockNetworkSupport.headerValue("Referer", in: request),
+                        desktopV: MockNetworkSupport.headerValue("desktop-v", in: request),
+                        authorization: MockNetworkSupport.headerValue("Authorization", in: request),
+                        cookie: MockNetworkSupport.headerValue("Cookie", in: request),
+                        csrfHeader: MockNetworkSupport.headerValue("X-CSRFToken", in: request)
+                    )
+                )
+            }
+            if path == "/api/v3/lesson/checkin" {
+                return .json(200, #"{"code":40002,"msg":"改走网页端签到"}"#)
+            }
+            if path == "/api/lesson/web_check_in" {
+                return .json(200, #"{"code":0,"msg":"网页端签到成功"}"#)
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+        let wwwCookieAccount = makeAccount(
+            id: "cookie-acc-web",
+            label: "网页兜底测试",
+            host: "www.yuketang.cn",
+            scheme: "https",
+            bearer: nil,
+            sessionId: "web-sid-fallback",
+            csrfToken: "web-csrf-fallback"
+        )
+        let webRes = await webOrch.checkIn(
+            account: wwwCookieAccount,
+            ticket: QrCodeParser.parse("lessonId=777", profile: profile)
+        )
+        XCTAssertEqual(webRes.state, .success)
+        XCTAssertEqual(webRes.strategyId, "LESSON_WEB")
+
+        let webReq = try XCTUnwrap(webFallbackCaptured.get().last)
+        XCTAssertEqual(webReq.path, "/api/lesson/web_check_in")
+        XCTAssertEqual(webReq.xClient, "web")
+        XCTAssertEqual(webReq.xtbz, "ykt")
+        XCTAssertEqual(webReq.origin, "https://www.yuketang.cn")
+        XCTAssertNotEqual(webReq.origin, "file://")
+        XCTAssertEqual(webReq.referer, "https://www.yuketang.cn/v2/web/index")
+        XCTAssertNil(webReq.desktopV)
+        XCTAssertNil(webReq.authorization)
+        XCTAssertTrue(webReq.cookie?.contains("sessionid=web-sid-fallback") == true)
+    }
+
+    func testCode50000UnauthenticatedAndTypoLoginFailureClassifyAsAuthExpired() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        XCTAssertTrue(profile.result.authKeywords.contains("unauthenticated"))
+        XCTAssertTrue(profile.result.authKeywords.contains("登陆"))
+        XCTAssertTrue(ProtocolCatalog.fallback.result.authKeywords.contains("unauthenticated"))
+        XCTAssertTrue(ProtocolCatalog.fallback.result.authKeywords.contains("登陆"))
+
+        let dynTicket = QrCodeParser.parse("c=auth1&t=1763900000&s=sig1&lessonId=2026", profile: profile)
+        let noLessonTicket = QrCodeParser.parse("c=auth2&t=1763900000&s=sig2", profile: profile)
+
+        // 1) 直接分类校验：code 50000 UNAUTHENTICATED 与“登陆失败，请重新登录”/“登陆失败，请重试”
+        let classifier = makeOrchestrator(profile: profile) { _ in .json(200, #"{"code":0}"#) }
+        XCTAssertEqual(
+            classifier.classify(httpStatus: 200, businessCode: 50000, message: "UNAUTHENTICATED", bodyText: ""),
+            .authExpired
+        )
+        XCTAssertEqual(
+            classifier.classify(httpStatus: 200, businessCode: 401, message: "登陆失败，请重新登录", bodyText: ""),
+            .authExpired
+        )
+        XCTAssertEqual(
+            classifier.classify(httpStatus: 200, businessCode: 40100, message: "登陆失败，请重试", bodyText: ""),
+            .authExpired
+        )
+
+        // 2) 端到端签到：HTTP 200 {"code":50000,"msg":"UNAUTHENTICATED","data":""} -> .authExpired 且立即中止策略链
+        let unauthCalls = LockedBox(0)
+        let unauthOrch = makeOrchestrator(profile: profile) { _ in
+            unauthCalls.withLock { $0 += 1 }
+            return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+        }
+        let rUnauth = await unauthOrch.checkIn(
+            account: makeAccount(bearer: nil, sessionId: "expired-sid"),
+            ticket: dynTicket
+        )
+        XCTAssertEqual(rUnauth.state, .authExpired)
+        XCTAssertEqual(unauthCalls.get(), 1, "code 50000 UNAUTHENTICATED 必须归类为 .authExpired 并立即中止")
+
+        // 3) 端到端 activeLesson 发现阶段返回 50000 UNAUTHENTICATED -> .authExpired
+        let discoverCalls = LockedBox(0)
+        let discoverOrch = makeOrchestrator(profile: profile) { _ in
+            discoverCalls.withLock { $0 += 1 }
+            return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+        }
+        let rDiscover = await discoverOrch.checkIn(
+            account: makeAccount(bearer: nil, sessionId: "expired-sid"),
+            ticket: noLessonTicket
+        )
+        XCTAssertEqual(rDiscover.state, .authExpired)
+        XCTAssertEqual(discoverCalls.get(), 1)
+
+        // 4) 端到端签到：HTTP 200 {"code":401,"msg":"登陆失败，请重新登录"} -> .authExpired 且立即中止
+        let typoCalls = LockedBox(0)
+        let typoOrch = makeOrchestrator(profile: profile) { _ in
+            typoCalls.withLock { $0 += 1 }
+            return .json(200, #"{"code":401,"msg":"登陆失败，请重新登录"}"#)
+        }
+        let rTypo = await typoOrch.checkIn(
+            account: makeAccount(bearer: nil, sessionId: "expired-sid"),
+            ticket: dynTicket
+        )
+        XCTAssertEqual(rTypo.state, .authExpired)
+        XCTAssertEqual(typoCalls.get(), 1, "“登陆失败，请重新登录”必须归类为 .authExpired 并立即中止")
+
+        // 5) 仅含“登陆”异体字（不含“登录”）也必须归类为 .authExpired
+        let typoOnlyCalls = LockedBox(0)
+        let typoOnlyOrch = makeOrchestrator(profile: profile) { _ in
+            typoOnlyCalls.withLock { $0 += 1 }
+            return .json(200, #"{"code":40100,"msg":"登陆失败，请重试"}"#)
+        }
+        let rTypoOnly = await typoOnlyOrch.checkIn(
+            account: makeAccount(bearer: nil, sessionId: "expired-sid"),
+            ticket: dynTicket
+        )
+        XCTAssertEqual(rTypoOnly.state, .authExpired)
+        XCTAssertEqual(typoOnlyCalls.get(), 1)
+    }
 }

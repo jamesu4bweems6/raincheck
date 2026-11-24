@@ -6,8 +6,9 @@
 
 - **单色基底 + 单一点缀色**：浅色背景纯中性 `#F5F5F7`、深色背景纯中性 `#0A0A0C`，全应用仅使用一套克制的冷蓝 `AccentColor`（浅色 `0.110 / 0.390 / 0.780`，深色 `0.360 / 0.620 / 0.960`）用于主操作与选中状态，严禁多色混搭、彩色渐变背景与彩虹标签。
 - **原生 Liquid Glass**：在 `#if compiler(>=6.2)` 与 `#available(iOS 26.0, *)` 下直接调用 `GlassEffectContainer`、`.glassEffect(...)`、`.glassEffectID(_:in:)`、`.buttonStyle(.glass / .glassProminent)` 与 `.tabBarMinimizeBehavior(.onScrollDown)`，界面留白充足、不堆叠多余装饰。
-- **纯系统框架与严格并发**：仅使用 `Foundation`、`SwiftUI`、`UIKit`、`WebKit`、`Security`、`AVFoundation`、`CoreImage`、`CoreGraphics`，全面启用 `SWIFT_STRICT_CONCURRENCY: complete`。
-- **多方式登录与会话安全**：支持微信扫码登录（75s 长轮询超时、真实站点直连 `/api/v3/user/login` 自动刷新过期二维码，本地演练站点保留 `wait-for-scan` 兼容）、手机号短信验证码登录（`PhoneLoginClient.swift` 对接官方 `/pc/login/send_sms_login_code/` 与 `/pc/login/verify_pwd_login/`，配合 `CaptchaSheet.swift` 腾讯防水墙交互式 `WKWebView` 验证）以及手动凭据导入。
+- **纯系统框架与严格并发**：仅使用 `Foundation`、`SwiftUI`、`UIKit`、`WebKit`、`Security`、`AVFoundation`、`PhotosUI`、`Vision`、`CoreImage`、`CoreGraphics`、`ImageIO`，全面启用 `SWIFT_STRICT_CONCURRENCY: complete`。
+- **账号接入与 Web 会话校验**：已移除微信二维码账号登录入口，专注手机号短信验证码登录（`PhoneLoginClient.swift` 对接官方 `/pc/login/send_sms_login_code/` 与 `/pc/login/verify_pwd_login/`，配合 `CaptchaSheet.swift` 腾讯防水墙交互式 `WKWebView` 验证）与手动凭据导入；网络层统一使用官方 Web 请求头（`X-Client: web`、`xtbz: ykt` 及同源 `Origin` / `Referer`，自动剥离旧 `desktop-v` 与 `Origin: file://`），并在短期课堂 `bearer` 过期时自动回退纯 Cookie 重试，同时兼容 Django 含 `expires=Tue, ... GMT` 日期逗号的多段 `Set-Cookie` 解析。
+- **签到扫码增强**：`CameraScannerSheet.swift` 支持双指缩放、快捷倍率切换、点击对焦及系统相册选图，配合 `QrImageDecoder.swift`（`Vision` 优先 + `CoreImage` 兜底）解码相册中的签到二维码。
 - **本地安全与脱敏导出**：账号凭据（Bearer / SessionID / CSRFToken）存入 Keychain（`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`），元信息开启文件保护并排除备份；签到结果 `SignResult` 通过显式 `CodingKeys` 排除任何凭据字段。
 
 ## 模块目录结构
@@ -26,12 +27,12 @@ iosApp/
 │       └── AppIcon.appiconset/         # 3 套 1024x1024 无透明通道图标（AppIcon-Light / Dark / Tinted）
 ├── Sources/RainCheck/
 │   ├── App/                            # 应用入口与 3 Tab 根视图（签到 / 账号 / 记录）
-│   ├── DesignSystem/                   # iOS 27 Liquid Glass 主题、基础控件、二维码板、扫码页与 CaptchaSheet.swift
+│   ├── DesignSystem/                   # iOS 27 Liquid Glass 主题、基础控件、CameraScannerSheet（缩放/对焦/选图）、QrImageDecoder 与 CaptchaSheet
 │   ├── Domain/                         # 领域模型、协议目录加载与二维码解析器
-│   ├── Networking/                     # RainCheckClient、CheckInOrchestrator、QrLoginClient 与 PhoneLoginClient.swift
+│   ├── Networking/                     # RainCheckClient（Web 请求头与会话重试）、CheckInOrchestrator 与 PhoneLoginClient
 │   ├── Storage/                        # Keychain 安全存储与 @MainActor AppStore
-│   └── Features/                       # 签到、账号管理、扫码/手机号验证码/手动导入表单与签到记录页面
-└── Tests/RainCheckTests/               # XCTest 单元测试（含 QrLoginClientTests、PhoneLoginClientTests 与 20 组跨端向量）
+│   └── Features/                       # 签到、账号管理、手机号验证码/手动导入表单与签到记录页面
+└── Tests/RainCheckTests/               # XCTest 单元测试（PhoneLoginClientTests、CheckInOrchestratorTests、QrCodeParserTests、QrImageDecoderTests 与 20 组跨端向量）
 ```
 
 ## 构建与测试（macOS / CI）

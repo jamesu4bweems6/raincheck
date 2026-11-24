@@ -218,7 +218,7 @@ struct CheckInView: View {
                         .foregroundStyle(LiquidPalette.primaryText)
                         .padding(.top, 1)
 
-                    Text("这是登录二维码，请前往「账号」页使用扫码登录。")
+                    Text("这是登录二维码而非课堂签到码；如需添加账号，请前往「账号」页使用手机号验证码登录或手动导入。")
                         .font(.footnote)
                         .foregroundStyle(LiquidPalette.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)

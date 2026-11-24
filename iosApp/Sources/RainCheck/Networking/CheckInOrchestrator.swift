@@ -84,7 +84,7 @@ final class CheckInOrchestrator: Sendable {
                 accountLabel: currentAccount.label,
                 host: currentAccount.host,
                 state: .notInClass,
-                message: "这是登录二维码，请先在账号页扫码登录",
+                message: "这是登录二维码而非课堂签到码；如需添加账号请前往「账号」页使用手机号验证码登录或手动导入",
                 elapsedMs: max(0, RainCheckTime.nowMillis() - startedMs),
                 attempts: traces,
                 timestampMs: RainCheckTime.nowMillis(),

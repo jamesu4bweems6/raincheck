@@ -432,7 +432,7 @@ struct ResultSpec: Codable, Hashable, Sendable {
         messageFields: [String] = ["msg", "message"],
         altMessageKeys: [String] = ["errmsg"],
         alreadyKeywords: [String] = ["已签到", "已经签到", "重复签到", "已参与"],
-        authKeywords: [String] = ["登录", "未授权", "身份", "token", "会话", "unauthorized"],
+        authKeywords: [String] = ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"],
         expiredKeywords: [String] = ["失效", "过期", "不存在", "二维码已"],
         retryHttpStatus: [Int] = [408, 425, 429, 500, 502, 503, 504]
     ) {
@@ -467,7 +467,7 @@ struct ResultSpec: Codable, Hashable, Sendable {
         self.messageFields = try c.decodeIfPresent([String].self, forKey: .messageFields) ?? ["msg", "message"]
         self.altMessageKeys = try c.decodeIfPresent([String].self, forKey: .altMessageKeys) ?? ["errmsg"]
         self.alreadyKeywords = try c.decodeIfPresent([String].self, forKey: .alreadyKeywords) ?? ["已签到", "已经签到", "重复签到", "已参与"]
-        self.authKeywords = try c.decodeIfPresent([String].self, forKey: .authKeywords) ?? ["登录", "未授权", "身份", "token", "会话", "unauthorized"]
+        self.authKeywords = try c.decodeIfPresent([String].self, forKey: .authKeywords) ?? ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"]
         self.expiredKeywords = try c.decodeIfPresent([String].self, forKey: .expiredKeywords) ?? ["失效", "过期", "不存在", "二维码已"]
         self.retryHttpStatus = try c.decodeIfPresent([Int].self, forKey: .retryHttpStatus) ?? [408, 425, 429, 500, 502, 503, 504]
     }
@@ -624,9 +624,7 @@ enum ProtocolCatalog {
         editions: Edition.presets,
         headers: [
             "xtbz": "ykt",
-            "desktop-v": "v2",
-            "X-Client": "desktop",
-            "Origin": "file://",
+            "X-Client": "web",
             "Accept": "application/json, text/plain, */*"
         ],
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -832,7 +830,7 @@ enum ProtocolCatalog {
             messageFields: ["msg", "message"],
             altMessageKeys: ["errmsg"],
             alreadyKeywords: ["已签到", "已经签到", "重复签到", "已参与"],
-            authKeywords: ["登录", "未授权", "身份", "token", "会话", "unauthorized"],
+            authKeywords: ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"],
             expiredKeywords: ["失效", "过期", "不存在", "二维码已"],
             retryHttpStatus: [408, 425, 429, 500, 502, 503, 504]
         )

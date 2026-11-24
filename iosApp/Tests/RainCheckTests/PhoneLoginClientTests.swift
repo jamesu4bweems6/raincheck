@@ -485,4 +485,379 @@ final class PhoneLoginClientTests: XCTestCase {
         }
         XCTAssertEqual(codeValidationCalls.get(), 0)
     }
+
+    // MARK: - Web Headers Across Editions, Django Multi-Cookie & Stale Bearer Fallback
+
+    func testLoginWithSmsCodeFetchMeSendsCleanWebHeadersAcrossEditions() async throws {
+        struct CapturedMeHeaders: Sendable {
+            let xClient: String?
+            let xtbz: String?
+            let origin: String?
+            let referer: String?
+            let desktopV: String?
+            let authorization: String?
+            let cookie: String?
+            let csrfHeader: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let editionIds = ["www", "pro", "changjiang", "huanghe", "mock"]
+
+        for editionId in editionIds {
+            let edition = try XCTUnwrap(profile.edition(editionId), "profile 应包含站点 \(editionId)")
+            let expectedOrigin = "\(edition.scheme)://\(edition.host)"
+            let expectedReferer = "\(expectedOrigin)/v2/web/index"
+
+            let loginDesktopVSeen = LockedBox<String?>(nil)
+            let meHeadersSeen = LockedBox<CapturedMeHeaders?>(nil)
+
+            let client = makeClient(profile: profile) { request in
+                let path = Self.rawPathPreservingTrailingSlash(of: request)
+                switch path {
+                case "/pc/login/verify_pwd_login/":
+                    loginDesktopVSeen.set(MockNetworkSupport.headerValue("desktop-v", in: request))
+                    return .json(
+                        200,
+                        #"{"success":true,"msg":"","data":{}}"#,
+                        headers: [
+                            "Set-Cookie": "sessionid=web-sid-\(editionId); HttpOnly; Path=/, csrftoken=web-csrf-\(editionId); Path=/"
+                        ]
+                    )
+                case "/api/v3/user/basic-info":
+                    let captured = CapturedMeHeaders(
+                        xClient: MockNetworkSupport.headerValue("X-Client", in: request),
+                        xtbz: MockNetworkSupport.headerValue("xtbz", in: request),
+                        origin: MockNetworkSupport.headerValue("Origin", in: request),
+                        referer: MockNetworkSupport.headerValue("Referer", in: request),
+                        desktopV: MockNetworkSupport.headerValue("desktop-v", in: request),
+                        authorization: MockNetworkSupport.headerValue("Authorization", in: request),
+                        cookie: MockNetworkSupport.headerValue("Cookie", in: request),
+                        csrfHeader: MockNetworkSupport.headerValue("X-CSRFToken", in: request)
+                    )
+                    meHeadersSeen.set(captured)
+                    // 模拟真实雨课堂网关：携带 desktop-v / X-Client: desktop / Origin: file:// 时拒签 Web Cookie
+                    if captured.desktopV != nil || captured.xClient != "web" || captured.origin == "file://" {
+                        return .json(401, #"{"code":401,"msg":"登录失效，请重新登录"}"#)
+                    }
+                    return .json(
+                        200,
+                        #"{"code":0,"msg":"","data":{"id":"uid-\#(editionId)","name":"用户-\#(editionId)"}}"#
+                    )
+                default:
+                    return .json(404, #"{"code":40400}"#)
+                }
+            }
+
+            let account = try await client.loginWithSmsCode(
+                edition: edition,
+                phone: "13800138000",
+                code: "654321"
+            )
+
+            XCTAssertNil(loginDesktopVSeen.get(), "\(editionId) 登录请求不应发送 desktop-v")
+            let meHeaders = try XCTUnwrap(meHeadersSeen.get(), "\(editionId) 必须调用 basic-info")
+            XCTAssertEqual(meHeaders.xClient, "web", "\(editionId) fetchMe 必须发送 X-Client: web")
+            XCTAssertEqual(meHeaders.xtbz, "ykt", "\(editionId) fetchMe 必须发送 xtbz: ykt")
+            XCTAssertEqual(meHeaders.origin, expectedOrigin, "\(editionId) fetchMe Origin 必须同源")
+            XCTAssertNotEqual(meHeaders.origin, "file://", "\(editionId) fetchMe 绝不能发送 Origin: file://")
+            XCTAssertEqual(meHeaders.referer, expectedReferer, "\(editionId) fetchMe Referer 必须指向 /v2/web/index")
+            XCTAssertNil(meHeaders.desktopV, "\(editionId) fetchMe 绝不能发送 desktop-v")
+            XCTAssertNil(meHeaders.authorization, "\(editionId) 纯 Cookie 登录不应发送 Authorization")
+            XCTAssertTrue(meHeaders.cookie?.contains("sessionid=web-sid-\(editionId)") == true)
+            XCTAssertTrue(meHeaders.cookie?.contains("csrftoken=web-csrf-\(editionId)") == true)
+            XCTAssertEqual(meHeaders.csrfHeader, "web-csrf-\(editionId)")
+
+            XCTAssertEqual(account.sessionId, "web-sid-\(editionId)")
+            XCTAssertEqual(account.csrfToken, "web-csrf-\(editionId)")
+            XCTAssertEqual(account.userId, "uid-\(editionId)")
+            XCTAssertEqual(account.label, "用户-\(editionId)")
+            XCTAssertNotNil(account.lastOkAt)
+        }
+
+        // 防御性清洗校验：即使传入历史桌面端 headers 配置，fetchMe 也必须强制清理为同源 Web 请求头
+        let legacyProfile = ProtocolProfile(
+            version: profile.version,
+            name: profile.name,
+            updatedAt: profile.updatedAt,
+            defaultEdition: profile.defaultEdition,
+            editions: profile.editions,
+            headers: [
+                "xtbz": "ykt",
+                "desktop-v": "v2",
+                "X-Client": "desktop",
+                "Origin": "file://",
+                "Accept": "application/json, text/plain, */*"
+            ],
+            userAgent: profile.userAgent,
+            auth: profile.auth,
+            endpoints: profile.endpoints,
+            strategies: profile.strategies,
+            qr: profile.qr,
+            result: profile.result
+        )
+        let wwwEdition = try XCTUnwrap(legacyProfile.edition("www"))
+        let sanitizedHeaders = LockedBox<CapturedMeHeaders?>(nil)
+        let legacyClient = makeClient(profile: legacyProfile) { request in
+            let path = Self.rawPathPreservingTrailingSlash(of: request)
+            if path == "/pc/login/verify_pwd_login/" {
+                return .json(
+                    200,
+                    #"{"success":true,"msg":""}"#,
+                    headers: ["Set-Cookie": "sessionid=legacy-sid; HttpOnly; Path=/"]
+                )
+            }
+            if path == "/api/v3/user/basic-info" {
+                sanitizedHeaders.set(
+                    CapturedMeHeaders(
+                        xClient: MockNetworkSupport.headerValue("X-Client", in: request),
+                        xtbz: MockNetworkSupport.headerValue("xtbz", in: request),
+                        origin: MockNetworkSupport.headerValue("Origin", in: request),
+                        referer: MockNetworkSupport.headerValue("Referer", in: request),
+                        desktopV: MockNetworkSupport.headerValue("desktop-v", in: request),
+                        authorization: MockNetworkSupport.headerValue("Authorization", in: request),
+                        cookie: MockNetworkSupport.headerValue("Cookie", in: request),
+                        csrfHeader: MockNetworkSupport.headerValue("X-CSRFToken", in: request)
+                    )
+                )
+                return .json(200, #"{"code":0,"data":{"id":"u-legacy","name":"老配置用户"}}"#)
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+        let legacyAccount = try await legacyClient.loginWithSmsCode(
+            edition: wwwEdition,
+            phone: "13800138000",
+            code: "123456"
+        )
+        let cleaned = try XCTUnwrap(sanitizedHeaders.get())
+        XCTAssertEqual(cleaned.xClient, "web")
+        XCTAssertEqual(cleaned.xtbz, "ykt")
+        XCTAssertEqual(cleaned.origin, "https://www.yuketang.cn")
+        XCTAssertNotEqual(cleaned.origin, "file://")
+        XCTAssertEqual(cleaned.referer, "https://www.yuketang.cn/v2/web/index")
+        XCTAssertNil(cleaned.desktopV)
+        XCTAssertEqual(legacyAccount.label, "老配置用户")
+    }
+
+    func testDjangoMultiCookieSetCookieWithExpiresCommaParsesBothSessionAndCsrf() async throws {
+        let djangoSetCookie =
+            "csrftoken=csrf_django_2027_val; expires=Tue, 23-Nov-2027 11:52:14 GMT; Max-Age=31449600; Path=/, sessionid=real_sid_value; HttpOnly; Path=/"
+
+        // 1) 直接测试 CredentialSanitizer 拆分与提取：绝不被 expires 日期逗号截断，绝不泄漏 Cookie 属性
+        let entries = CredentialSanitizer.splitSetCookieHeader(djangoSetCookie)
+        XCTAssertEqual(entries.count, 2, "expires 日期中的逗号不可拆段，应精确拆分为 2 条 Cookie")
+        XCTAssertTrue(entries[0].hasPrefix("csrftoken=csrf_django_2027_val"))
+        XCTAssertTrue(entries[1].hasPrefix("sessionid=real_sid_value"))
+
+        let parsedSession = CredentialSanitizer.cleanCookieValue(djangoSetCookie, key: "sessionid")
+        let parsedCsrf = CredentialSanitizer.cleanCookieValue(djangoSetCookie, key: "csrftoken")
+        XCTAssertEqual(parsedSession, "real_sid_value")
+        XCTAssertEqual(parsedCsrf, "csrf_django_2027_val")
+
+        let prefixedReversed =
+            "Set-Cookie: sessionid=real_sid_value; expires=Tue, 23-Nov-2027 11:52:14 GMT; HttpOnly; Path=/, csrftoken=csrf_django_2027_val; Max-Age=31449600; Path=/"
+        XCTAssertEqual(CredentialSanitizer.cleanCookieValue(prefixedReversed, key: "sessionid"), "real_sid_value")
+        XCTAssertEqual(CredentialSanitizer.cleanCookieValue(prefixedReversed, key: "csrftoken"), "csrf_django_2027_val")
+
+        // 2) 端到端测试 PhoneLoginClient.loginWithSmsCode 提取与透传至 basic-info
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+        let meCookieSeen = LockedBox<String?>(nil)
+        let meCsrfSeen = LockedBox<String?>(nil)
+
+        let client = makeClient(profile: profile) { request in
+            let path = Self.rawPathPreservingTrailingSlash(of: request)
+            switch path {
+            case "/pc/login/verify_pwd_login/":
+                return .json(
+                    200,
+                    #"{"success":true,"msg":"","data":{}}"#,
+                    headers: ["Set-Cookie": djangoSetCookie]
+                )
+            case "/api/v3/user/basic-info":
+                meCookieSeen.set(MockNetworkSupport.headerValue("Cookie", in: request))
+                meCsrfSeen.set(MockNetworkSupport.headerValue("X-CSRFToken", in: request))
+                return .json(200, #"{"code":0,"msg":"","data":{"id":"u-django","name":"孙同学"}}"#)
+            default:
+                return .json(404, #"{"code":40400}"#)
+            }
+        }
+
+        let account = try await client.loginWithSmsCode(
+            edition: edition,
+            phone: "13800138000",
+            code: "654321"
+        )
+
+        XCTAssertEqual(account.sessionId, "real_sid_value")
+        XCTAssertEqual(account.csrfToken, "csrf_django_2027_val")
+        XCTAssertEqual(account.userId, "u-django")
+        XCTAssertEqual(account.label, "孙同学")
+        XCTAssertNotNil(account.lastOkAt)
+
+        let sentCookie = try XCTUnwrap(meCookieSeen.get())
+        XCTAssertTrue(sentCookie.contains("sessionid=real_sid_value"))
+        XCTAssertTrue(sentCookie.contains("csrftoken=csrf_django_2027_val"))
+        for leakedAttr in ["expires", "Max-Age", "Path=", "HttpOnly", ","] {
+            XCTAssertFalse(sentCookie.contains(leakedAttr), "Cookie 请求头不得泄漏属性片段: \(leakedAttr)")
+        }
+        XCTAssertEqual(meCsrfSeen.get(), "csrf_django_2027_val")
+    }
+
+    func testFetchMeRetriesCookieOnlyWhenStaleBearerFailsWith401() async throws {
+        struct MeAttempt: Sendable {
+            let authorization: String?
+            let cookie: String?
+            let csrfHeader: String?
+            let xClient: String?
+            let xtbz: String?
+            let origin: String?
+            let referer: String?
+            let desktopV: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let attempts = LockedBox<[MeAttempt]>([])
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request)
+            let cookie = MockNetworkSupport.headerValue("Cookie", in: request)
+            attempts.withLock {
+                $0.append(
+                    MeAttempt(
+                        authorization: auth,
+                        cookie: cookie,
+                        csrfHeader: MockNetworkSupport.headerValue("X-CSRFToken", in: request),
+                        xClient: MockNetworkSupport.headerValue("X-Client", in: request),
+                        xtbz: MockNetworkSupport.headerValue("xtbz", in: request),
+                        origin: MockNetworkSupport.headerValue("Origin", in: request),
+                        referer: MockNetworkSupport.headerValue("Referer", in: request),
+                        desktopV: MockNetworkSupport.headerValue("desktop-v", in: request)
+                    )
+                )
+            }
+
+            if auth != nil {
+                return .json(401, #"{"code":401,"msg":"登录失效，请重新登录"}"#)
+            }
+            if cookie?.contains("sessionid=valid-web-sid-888") == true {
+                return .json(200, #"{"code":0,"msg":"","data":{"id":"u-5566","name":"陈同学"}}"#)
+            }
+            return .json(401, #"{"code":401,"msg":"缺少有效会话"}"#)
+        }
+
+        let rainClient = RainCheckClient(session: session, profile: profile)
+        let staleAccount = Account(
+            id: "acc-stale-bearer",
+            label: "雨课堂用户(8000)",
+            host: "changjiang.yuketang.cn",
+            scheme: "https",
+            bearer: "stale-lesson-bearer-999",
+            sessionId: "valid-web-sid-888",
+            csrfToken: "valid-web-csrf-777"
+        )
+
+        let verified = try await rainClient.fetchMe(account: staleAccount)
+
+        let recorded = attempts.get()
+        XCTAssertEqual(recorded.count, 2, "首次携带过期 Bearer 401 后应自动回退纯 Cookie 重试一次")
+        XCTAssertEqual(recorded[0].authorization, "Bearer stale-lesson-bearer-999")
+        XCTAssertNil(recorded[1].authorization, "第二次纯 Cookie 重试绝不能携带 Authorization 头")
+        XCTAssertTrue(recorded[1].cookie?.contains("sessionid=valid-web-sid-888") == true)
+        XCTAssertTrue(recorded[1].cookie?.contains("csrftoken=valid-web-csrf-777") == true)
+        XCTAssertEqual(recorded[1].csrfHeader, "valid-web-csrf-777")
+
+        for attempt in recorded {
+            XCTAssertEqual(attempt.xClient, "web")
+            XCTAssertEqual(attempt.xtbz, "ykt")
+            XCTAssertEqual(attempt.origin, "https://changjiang.yuketang.cn")
+            XCTAssertNotEqual(attempt.origin, "file://")
+            XCTAssertEqual(attempt.referer, "https://changjiang.yuketang.cn/v2/web/index")
+            XCTAssertNil(attempt.desktopV)
+        }
+
+        XCTAssertEqual(verified.userId, "u-5566")
+        XCTAssertEqual(verified.name, "陈同学")
+        let refreshed = try XCTUnwrap(verified.refreshedAccount)
+        XCTAssertNil(refreshed.bearer, "纯 Cookie 重试成功后必须清除已过期的旧 bearer")
+        XCTAssertEqual(refreshed.sessionId, "valid-web-sid-888")
+        XCTAssertEqual(refreshed.csrfToken, "valid-web-csrf-777")
+        XCTAssertEqual(refreshed.userId, "u-5566")
+        XCTAssertEqual(refreshed.label, "陈同学")
+        XCTAssertNotNil(refreshed.lastOkAt)
+    }
+
+    @MainActor
+    func testAppStoreVerifyAccountUpgradesPlaceholderLabelAndPreservesCustomLabel() async throws {
+        XCTAssertTrue(Account.isPlaceholderLabel("雨课堂用户(8000)"))
+        XCTAssertTrue(Account.isPlaceholderLabel("账号 1"))
+        XCTAssertTrue(Account.isPlaceholderLabel("   "))
+        XCTAssertFalse(Account.isPlaceholderLabel("周同学"))
+        XCTAssertFalse(Account.isPlaceholderLabel("我的主号"))
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request)
+            let cookie = MockNetworkSupport.headerValue("Cookie", in: request) ?? ""
+            if auth != nil {
+                return .json(401, #"{"code":401,"msg":"登录失效，请重新登录"}"#)
+            }
+            if cookie.contains("sessionid=sid-placeholder-8000") {
+                return .json(200, #"{"code":0,"msg":"","data":{"id":"u-8000","name":"周同学"}}"#)
+            }
+            if cookie.contains("sessionid=sid-custom-9000") {
+                return .json(200, #"{"code":0,"msg":"","data":{"id":"u-9000","name":"服务端真实姓名"}}"#)
+            }
+            return .json(401, #"{"code":401,"msg":"登录失效，请重新登录"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        let placeholderAccount = Account(
+            id: "acc-placeholder-8000",
+            label: "雨课堂用户(8000)",
+            host: "www.yuketang.cn",
+            scheme: "https",
+            bearer: "stale-jwt-8000",
+            sessionId: "sid-placeholder-8000",
+            csrfToken: "csrf-8000",
+            lastOkAt: nil,
+            userId: nil
+        )
+        let customAccount = Account(
+            id: "acc-custom-9000",
+            label: "我的主号",
+            host: "pro.yuketang.cn",
+            scheme: "https",
+            bearer: nil,
+            sessionId: "sid-custom-9000",
+            csrfToken: "csrf-9000",
+            lastOkAt: nil,
+            userId: nil
+        )
+        try store.addOrUpdateAccount(placeholderAccount)
+        try store.addOrUpdateAccount(customAccount)
+
+        await store.verifyAccount(id: "acc-placeholder-8000")
+
+        let upgraded = try XCTUnwrap(store.accounts.first(where: { $0.id == "acc-placeholder-8000" }))
+        XCTAssertEqual(upgraded.label, "周同学", "占位标签 雨课堂用户(8000) 在 verifyAccount 通过后必须升级为真实用户名")
+        XCTAssertEqual(upgraded.userId, "u-8000")
+        XCTAssertNil(upgraded.bearer, "verifyAccount 经纯 Cookie 回退成功后应同步清理失效 bearer")
+        XCTAssertEqual(upgraded.sessionId, "sid-placeholder-8000")
+        XCTAssertNotNil(upgraded.lastOkAt)
+        XCTAssertEqual(store.toastMessage, "验证通过：周同学")
+
+        let persistedUpgraded = try XCTUnwrap(vault.load().first(where: { $0.id == "acc-placeholder-8000" }))
+        XCTAssertEqual(persistedUpgraded.label, "周同学")
+        XCTAssertNil(persistedUpgraded.bearer)
+        XCTAssertEqual(persistedUpgraded.userId, "u-8000")
+
+        // 用户自定义标签绝不被服务端用户名覆盖
+        await store.verifyAccount(id: "acc-custom-9000")
+        let preserved = try XCTUnwrap(store.accounts.first(where: { $0.id == "acc-custom-9000" }))
+        XCTAssertEqual(preserved.label, "我的主号")
+        XCTAssertEqual(preserved.userId, "u-9000")
+        XCTAssertNotNil(preserved.lastOkAt)
+    }
 }

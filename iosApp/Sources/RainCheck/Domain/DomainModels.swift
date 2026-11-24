@@ -176,6 +176,14 @@ struct Account: Codable, Hashable, Identifiable, Sendable {
         }
     }
 
+    /// 判断标签是否为空或自动生成的占位名（校验通过时可安全升级为服务端真实用户名）。
+    static func isPlaceholderLabel(_ label: String) -> Bool {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty
+            || trimmed.hasPrefix("雨课堂用户(")
+            || trimmed.hasPrefix("账号 ")
+    }
+
     /// 脱敏展示凭据，与 Kotlin `Models.kt` 规则保持严格一致。
     func maskedCredential() -> String {
         let raw: String
@@ -515,22 +523,126 @@ enum CredentialSanitizer {
         return working.isEmpty ? nil : working
     }
 
+    private static let cookieAttributeNames: Set<String> = [
+        "path", "domain", "expires", "max-age", "samesite", "httponly", "secure", "priority", "partitioned"
+    ]
+
+    /// 将逗号拼接的多条 `Set-Cookie` 响应头按真实 Cookie 边界拆分：
+    /// 仅在引号外遇到 `,` 且其后紧跟非属性名的 `<cookie-name>=` 时切分，
+    /// 绝不破坏 `expires=Tue, 23-Nov-2027 11:52:14 GMT` 等日期中的逗号。
+    static func splitSetCookieHeader(_ raw: String) -> [String] {
+        let chars = Array(raw)
+        let count = chars.count
+        var entries: [String] = []
+        var segmentStart = 0
+        var inQuotes = false
+        var index = 0
+
+        while index < count {
+            let ch = chars[index]
+            if ch == "\"" {
+                inQuotes.toggle()
+                index += 1
+                continue
+            }
+            if ch == "," && !inQuotes && isCookieBoundary(chars: chars, afterCommaIndex: index + 1) {
+                let piece = String(chars[segmentStart..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !piece.isEmpty {
+                    entries.append(piece)
+                }
+                segmentStart = index + 1
+            }
+            index += 1
+        }
+
+        if segmentStart <= count {
+            let tail = String(chars[segmentStart..<count]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tail.isEmpty {
+                entries.append(tail)
+            }
+        }
+        return entries
+    }
+
+    private static func isCookieBoundary(chars: [Character], afterCommaIndex: Int) -> Bool {
+        var cursor = afterCommaIndex
+        let count = chars.count
+        while cursor < count && (chars[cursor] == " " || chars[cursor] == "\t") {
+            cursor += 1
+        }
+        let tokenStart = cursor
+        while cursor < count {
+            let ch = chars[cursor]
+            if ch == "=" {
+                guard cursor > tokenStart else { return false }
+                let token = String(chars[tokenStart..<cursor]).lowercased()
+                return !cookieAttributeNames.contains(token)
+            }
+            if !isCookieNameChar(ch) {
+                return false
+            }
+            cursor += 1
+        }
+        return false
+    }
+
+    private static func isCookieNameChar(_ ch: Character) -> Bool {
+        guard let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1 else {
+            return false
+        }
+        let value = scalar.value
+        if value <= 0x20 || value >= 0x7F {
+            return false
+        }
+        switch ch {
+        case "(", ")", "<", ">", "@", ",", ";", ":", "\\", "\"", "/", "[", "]", "?", "=", "{", "}":
+            return false
+        default:
+            return true
+        }
+    }
+
+    private static func isExpiredCookieEntry(segments: [String]) -> Bool {
+        for segment in segments.dropFirst() {
+            guard let eqIdx = segment.firstIndex(of: "=") else { continue }
+            let attrName = String(segment[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let attrVal = String(segment[segment.index(after: eqIdx)...]).trimmingCharacters(in: quoteAndSpaceSet)
+            if attrName == "max-age", let seconds = Int(attrVal), seconds <= 0 {
+                return true
+            }
+            if attrName == "expires", (attrVal.contains("1970") || attrVal.contains("1969")) {
+                return true
+            }
+        }
+        return false
+    }
+
     static func cleanCookieValue(_ raw: String, key: String) -> String? {
-        var working = raw
-            .replacingOccurrences(of: "\r", with: "")
-            .replacingOccurrences(of: "\n", with: ";")
+        let normalizedNewlines = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if working.isEmpty {
+        if normalizedNewlines.isEmpty {
             return nil
         }
 
         var hadCookieHeaderPrefix = false
-        for prefix in ["set-cookie:", "cookie:"] {
-            if working.lowercased().hasPrefix(prefix) {
-                hadCookieHeaderPrefix = true
-                working = String(working.dropFirst(prefix.count))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+        var cookieEntries: [String] = []
+        for rawLine in normalizedNewlines.split(separator: "\n", omittingEmptySubsequences: true) {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            for prefix in ["set-cookie:", "cookie:"] {
+                if line.lowercased().hasPrefix(prefix) {
+                    hadCookieHeaderPrefix = true
+                    line = String(line.dropFirst(prefix.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
+            if !line.isEmpty {
+                cookieEntries.append(contentsOf: splitSetCookieHeader(line))
+            }
+        }
+        if cookieEntries.isEmpty {
+            return nil
         }
 
         let targetKeys: [String]
@@ -540,45 +652,64 @@ enum CredentialSanitizer {
             targetKeys = [key.lowercased()]
         }
 
-        let segments = working
-            .split(separator: ";", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        let entrySegments: [[String]] = cookieEntries.map { entry in
+            entry
+                .split(separator: ";", omittingEmptySubsequences: true)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
 
         for candidateKey in targetKeys {
-            for segment in segments {
-                guard let eqIdx = segment.firstIndex(of: "=") else { continue }
-                let name = String(segment[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if name.lowercased() == candidateKey {
-                    let value = String(segment[segment.index(after: eqIdx)...])
-                        .trimmingCharacters(in: quoteAndSpaceSet)
-                    if value.isEmpty || value.caseInsensitiveCompare("deleted") == .orderedSame {
-                        return nil
+            for segments in entrySegments {
+                if isExpiredCookieEntry(segments: segments) {
+                    continue
+                }
+                for segment in segments {
+                    guard let eqIdx = segment.firstIndex(of: "=") else { continue }
+                    let name = String(segment[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let lowerName = name.lowercased()
+                    if cookieAttributeNames.contains(lowerName) {
+                        continue
                     }
-                    return value
+                    if lowerName == candidateKey {
+                        let value = String(segment[segment.index(after: eqIdx)...])
+                            .trimmingCharacters(in: quoteAndSpaceSet)
+                        if value.isEmpty || value.caseInsensitiveCompare("deleted") == .orderedSame {
+                            continue
+                        }
+                        return value
+                    }
                 }
             }
         }
 
-        if hadCookieHeaderPrefix || segments.count > 1 {
-            if let first = segments.first, !first.contains("=") {
+        let allSegments = entrySegments.flatMap { $0 }
+        if hadCookieHeaderPrefix || cookieEntries.count > 1 || allSegments.count > 1 {
+            if cookieEntries.count == 1, let first = allSegments.first, !first.contains("=") {
                 let cleaned = first.trimmingCharacters(in: quoteAndSpaceSet)
-                return cleaned.isEmpty ? nil : cleaned
+                if cleaned.isEmpty
+                    || cleaned.caseInsensitiveCompare("deleted") == .orderedSame
+                    || cookieAttributeNames.contains(cleaned.lowercased()) {
+                    return nil
+                }
+                return cleaned
             }
             return nil
         }
 
-        if let only = segments.first {
+        if let only = allSegments.first {
             if let eqIdx = only.firstIndex(of: "=") {
                 let left = String(only[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let right = String(only[only.index(after: eqIdx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let knownOtherKeys = ["sessionid", "sid", "csrftoken", "csrf_token", "path", "domain", "expires", "max-age"]
-                if !right.isEmpty && knownOtherKeys.contains(left.lowercased()) {
+                let knownOtherKeys: Set<String> = ["sessionid", "sid", "csrftoken", "csrf_token"]
+                    .union(cookieAttributeNames)
+                if knownOtherKeys.contains(left.lowercased()) {
                     return nil
                 }
             }
             let cleaned = only.trimmingCharacters(in: quoteAndSpaceSet)
-            if cleaned.isEmpty || cleaned.caseInsensitiveCompare("deleted") == .orderedSame {
+            if cleaned.isEmpty
+                || cleaned.caseInsensitiveCompare("deleted") == .orderedSame
+                || cookieAttributeNames.contains(cleaned.lowercased()) {
                 return nil
             }
             return cleaned
