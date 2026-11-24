@@ -46,7 +46,30 @@ enum PhoneLoginError: Error, LocalizedError, Equatable, Sendable {
 /// 雨课堂官方 Web `/pc/login/*` 手机号 + 短信验证码登录客户端。
 final class PhoneLoginClient: Sendable {
     static let tencentCaptchaAppId = "2091064951"
-    static let hcaptchaSiteKey = "50f6f060-c606-4e3b-b6e8-ca3b706b61e1"
+
+    private static let fallbackSendSmsEndpoint = EndpointSpec(
+        method: "POST",
+        path: "/pc/login/send_sms_login_code/",
+        body: [
+            "mobile": .string("{mobile}"),
+            "login": .bool(true),
+            "ticket": .string("{ticket}"),
+            "randstr": .string("{randstr}"),
+            "hcaptcha_token": .string("{hcaptchaToken}")
+        ],
+        auth: false
+    )
+
+    private static let fallbackVerifyLoginEndpoint = EndpointSpec(
+        method: "POST",
+        path: "/pc/login/verify_pwd_login/",
+        body: [
+            "type": .string("PC"),
+            "name": .string("{mobile}"),
+            "pwd": .string("{code}")
+        ],
+        auth: false
+    )
 
     let session: URLSession
     let profile: ProtocolProfile
@@ -100,18 +123,20 @@ final class PhoneLoginClient: Sendable {
             throw PhoneLoginError.invalidPhone
         }
 
-        let payload = SendSmsPayload(
-            mobile: cleanedPhone,
-            login: true,
-            ticket: captcha.ticket.trimmingCharacters(in: .whitespacesAndNewlines),
-            randstr: captcha.randstr.trimmingCharacters(in: .whitespacesAndNewlines),
-            hcaptchaToken: captcha.hcaptchaToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
+        let endpoint = profile.endpoint("phoneSendSms") ?? Self.fallbackSendSmsEndpoint
+        let variables: [String: TemplateValue] = [
+            "mobile": .string(cleanedPhone),
+            "ticket": .string(captcha.ticket.trimmingCharacters(in: .whitespacesAndNewlines)),
+            "randstr": .string(captcha.randstr.trimmingCharacters(in: .whitespacesAndNewlines)),
+            "hcaptchaToken": .string(captcha.hcaptchaToken.trimmingCharacters(in: .whitespacesAndNewlines))
+        ]
+        let bodyTemplate = endpoint.body ?? Self.fallbackSendSmsEndpoint.body ?? [:]
 
         let request = try buildRequest(
             edition: edition,
-            path: "/pc/login/send_sms_login_code/",
-            payload: payload
+            endpoint: endpoint,
+            variables: variables,
+            bodyTemplate: bodyTemplate
         )
 
         let (data, httpResponse) = try await perform(request)
@@ -144,16 +169,18 @@ final class PhoneLoginClient: Sendable {
             throw PhoneLoginError.invalidCode
         }
 
-        let payload = VerifyPwdLoginPayload(
-            type: "PC",
-            name: cleanedPhone,
-            pwd: cleanedCode
-        )
+        let endpoint = profile.endpoint("phoneVerifyLogin") ?? Self.fallbackVerifyLoginEndpoint
+        let variables: [String: TemplateValue] = [
+            "mobile": .string(cleanedPhone),
+            "code": .string(cleanedCode)
+        ]
+        let bodyTemplate = endpoint.body ?? Self.fallbackVerifyLoginEndpoint.body ?? [:]
 
         let request = try buildRequest(
             edition: edition,
-            path: "/pc/login/verify_pwd_login/",
-            payload: payload
+            endpoint: endpoint,
+            variables: variables,
+            bodyTemplate: bodyTemplate
         )
 
         let (data, httpResponse) = try await perform(request)
@@ -214,28 +241,6 @@ final class PhoneLoginClient: Sendable {
 
     // MARK: - Private Types
 
-    private struct SendSmsPayload: Encodable, Sendable {
-        let mobile: String
-        let login: Bool
-        let ticket: String
-        let randstr: String
-        let hcaptchaToken: String
-
-        enum CodingKeys: String, CodingKey {
-            case mobile
-            case login
-            case ticket
-            case randstr
-            case hcaptchaToken = "hcaptcha_token"
-        }
-    }
-
-    private struct VerifyPwdLoginPayload: Encodable, Sendable {
-        let type: String
-        let name: String
-        let pwd: String
-    }
-
     private struct PcLoginResponse: Sendable {
         let success: Bool?
         let statusCode: Int?
@@ -258,28 +263,33 @@ final class PhoneLoginClient: Sendable {
     }
 
     private static func isUnsupportedEdition(_ edition: Edition) -> Bool {
-        edition.host
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .contains("xuetangx.com")
+        let scheme = edition.scheme.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let effectiveScheme = scheme.isEmpty ? "https" : scheme
+        let rawHost = edition.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let host = URLComponents(string: "\(effectiveScheme)://\(rawHost)")?.host?.lowercased() ?? rawHost
+        return host == "xuetangx.com" || host.hasSuffix(".xuetangx.com")
     }
 
-    private func buildRequest<Payload: Encodable>(
+    private func buildRequest(
         edition: Edition,
-        path: String,
-        payload: Payload
+        endpoint: EndpointSpec,
+        variables: [String: TemplateValue],
+        bodyTemplate: [String: TemplateValue]
     ) throws -> URLRequest {
         let scheme = edition.scheme.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let host = edition.host.trimmingCharacters(in: .whitespacesAndNewlines)
         let origin = "\(scheme)://\(host)"
-        let urlString = "\(origin)\(path)"
+        let renderedPath = TemplateRenderer.renderPath(endpoint.path, variables: variables)
+        let renderedQuery = TemplateRenderer.renderQuery(endpoint.query, variables: variables)
+        let urlString = TemplateRenderer.buildURL(base: origin, path: renderedPath, query: renderedQuery)
 
         guard let url = URL(string: urlString) else {
             throw PhoneLoginError.networkError("无效的请求地址: \(urlString)")
         }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        let method = endpoint.method.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        request.httpMethod = method.isEmpty ? "POST" : method
         request.timeoutInterval = RainCheckClient.defaultTimeoutInterval
         // 禁用系统共享 Cookie 池，避免多账号并发串号或单测污染
         request.httpShouldHandleCookies = false
@@ -294,10 +304,11 @@ final class PhoneLoginClient: Sendable {
             request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         }
 
+        let renderedBody = TemplateRenderer.renderBody(bodyTemplate, variables: variables)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         do {
-            request.httpBody = try encoder.encode(payload)
+            request.httpBody = try encoder.encode(renderedBody)
         } catch {
             throw PhoneLoginError.networkError("构造登录请求失败: \(error.localizedDescription)")
         }
@@ -473,7 +484,7 @@ final class PhoneLoginClient: Sendable {
         if let rawSetCookie = stringHeaders["Set-Cookie"] {
             if extractedSessionId == nil {
                 for candidate in acceptedSessionNames where !rejectedCookieNames.contains(candidate.lowercased()) {
-                    if let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: candidate) {
+                    if let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: candidate, allowBareValue: false) {
                         extractedSessionId = cleaned
                         break
                     }
@@ -481,7 +492,7 @@ final class PhoneLoginClient: Sendable {
             }
             if extractedCsrf == nil,
                !rejectedCookieNames.contains(csrfCookieName.lowercased()),
-               let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: csrfCookieName) {
+               let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: csrfCookieName, allowBareValue: false) {
                 extractedCsrf = cleaned
             }
         }

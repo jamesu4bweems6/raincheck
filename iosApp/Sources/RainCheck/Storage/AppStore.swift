@@ -7,6 +7,7 @@ final class AppStore: ObservableObject {
     @Published var accounts: [Account]
     @Published var selectedAccountIds: Set<String>
     @Published var currentTicket: QrTicket?
+    @Published private(set) var lastBatchTicket: QrTicket?
     @Published var dryRun: Bool
     @Published var isCheckingIn: Bool
     @Published var checkInCompletedCount: Int
@@ -24,6 +25,7 @@ final class AppStore: ObservableObject {
     private var checkInTask: Task<Void, Never>?
     private var activeCheckInRunId: UUID?
     private var toastTask: Task<Void, Never>?
+    private var lastBatchWasDryRun: Bool
 
     init(
         vault: any AccountVaulting = KeychainVault(),
@@ -43,6 +45,8 @@ final class AppStore: ObservableObject {
         self.accounts = loadedAccounts
         self.selectedAccountIds = Set(loadedAccounts.filter(\.enabled).map(\.id))
         self.currentTicket = nil
+        self.lastBatchTicket = nil
+        self.lastBatchWasDryRun = false
         self.dryRun = false
         self.isCheckingIn = false
         self.checkInCompletedCount = 0
@@ -138,6 +142,8 @@ final class AppStore: ObservableObject {
             return
         }
 
+        lastBatchTicket = ticket
+        lastBatchWasDryRun = dryRun
         runCheckIn(targets: targets, ticket: ticket, dryRun: dryRun, replacingResults: true)
     }
 
@@ -153,18 +159,19 @@ final class AppStore: ObservableObject {
 
     func retryFailed() {
         guard !isCheckingIn else { return }
-        guard let ticket = currentTicket else {
+        guard let ticket = lastBatchTicket else {
             showToast("当前没有可重试的签到目标")
             return
         }
-        let failedIds = Set(results.filter { !$0.state.isSuccessLike }.map(\.accountId))
+        let failedIds = Set(results.filter { $0.state.isFailureLike }.map(\.accountId))
         let targets = accounts.filter { $0.enabled && failedIds.contains($0.id) }
         guard !targets.isEmpty else {
             showToast("没有可重试的失败账号")
             return
         }
 
-        runCheckIn(targets: targets, ticket: ticket, dryRun: dryRun, replacingResults: false)
+        lastBatchWasDryRun = false
+        runCheckIn(targets: targets, ticket: ticket, dryRun: false, replacingResults: false)
     }
 
     private func runCheckIn(
@@ -185,6 +192,7 @@ final class AppStore: ObservableObject {
 
         let engine = self.orchestrator
         let capturedDryRun = dryRun
+        let snapshotById = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, $0) })
 
         checkInTask = Task { [weak self] in
             let batchResults = await engine.checkInBatch(
@@ -197,7 +205,10 @@ final class AppStore: ObservableObject {
                         guard let self, self.activeCheckInRunId == runId else { return }
                         self.checkInCompletedCount += 1
                         self.upsertResult(partial)
-                        self.mergeRefreshedAccountIfNeeded(from: partial)
+                        self.mergeRefreshedAccountIfNeeded(
+                            from: partial,
+                            snapshot: snapshotById[partial.accountId]
+                        )
                     }
                 }
             )
@@ -206,7 +217,10 @@ final class AppStore: ObservableObject {
             if !Task.isCancelled {
                 for result in batchResults {
                     self.upsertResult(result)
-                    self.mergeRefreshedAccountIfNeeded(from: result)
+                    self.mergeRefreshedAccountIfNeeded(
+                        from: result,
+                        snapshot: snapshotById[result.accountId]
+                    )
                 }
                 self.checkInCompletedCount = batchResults.count
                 let okCount = batchResults.filter { $0.state.isSuccessLike }.count
@@ -295,6 +309,8 @@ final class AppStore: ObservableObject {
 
     func clearResults() {
         results = []
+        lastBatchTicket = nil
+        lastBatchWasDryRun = false
     }
 
     /// 导出脱敏 JSON 报告（`SignResult.CodingKeys` 严格排除所有凭据与 `refreshedAccount`）。
@@ -302,8 +318,8 @@ final class AppStore: ObservableObject {
         let formatter = ISO8601DateFormatter()
         let report = ExportReport(
             exportedAt: formatter.string(from: Date()),
-            ticketSummary: currentTicket?.summary(),
-            dryRun: dryRun,
+            ticketSummary: (lastBatchTicket ?? currentTicket)?.summary(),
+            dryRun: lastBatchTicket != nil ? lastBatchWasDryRun : dryRun,
             results: results
         )
         let encoder = JSONEncoder()
@@ -341,9 +357,16 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func mergeRefreshedAccountIfNeeded(from result: SignResult) {
+    private func mergeRefreshedAccountIfNeeded(from result: SignResult, snapshot: Account? = nil) {
         if let refreshed = result.refreshedAccount {
-            applyRefreshedFields(from: refreshed, verifiedName: nil)
+            let snapshotHadBearer = !(snapshot?.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let refreshedHasBearer = !(refreshed.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let staleBearerToClear = (snapshotHadBearer && !refreshedHasBearer) ? snapshot?.bearer : nil
+            applyRefreshedFields(
+                from: refreshed,
+                verifiedName: nil,
+                clearingStaleBearer: staleBearerToClear
+            )
         }
 
         if result.state == .success || result.state == .already {

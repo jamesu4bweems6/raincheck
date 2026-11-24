@@ -264,7 +264,9 @@ final class CheckInOrchestratorTests: XCTestCase {
         XCTAssertEqual(batchResults.count, 1)
         let single = try XCTUnwrap(batchResults.first)
         XCTAssertEqual(single.state, .dryRun)
-        XCTAssertTrue(single.state.isSuccessLike)
+        XCTAssertFalse(single.state.isSuccessLike, "演练模式 .dryRun 不应计入真实签到成功")
+        XCTAssertTrue(single.state.isDryRun)
+        XCTAssertFalse(single.state.isFailureLike, "演练模式 .dryRun 不应计入失败或可重试项")
         XCTAssertFalse(single.attempts.isEmpty)
         XCTAssertTrue(single.attempts.allSatisfy { $0.httpStatus == nil })
     }
@@ -849,5 +851,296 @@ final class CheckInOrchestratorTests: XCTestCase {
         )
         XCTAssertEqual(rTypoOnly.state, .authExpired)
         XCTAssertEqual(typoOnlyCalls.get(), 1)
+    }
+
+    // MARK: - B2 Stale-Bearer Fallback & businessCode == 401
+
+    @MainActor
+    func testStaleBearerFallsBackToCookieOnlyInDiscoverActiveLessonAndClearsVault() async throws {
+        struct RecordedReq: Sendable {
+            let path: String
+            let auth: String?
+            let cookie: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let recorded = LockedBox<[RecordedReq]>([])
+
+        let session = MockNetworkSupport.makeSession { request in
+            let path = request.url?.path ?? ""
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request)
+            let cookie = MockNetworkSupport.headerValue("Cookie", in: request)
+            recorded.withLock { $0.append(RecordedReq(path: path, auth: auth, cookie: cookie)) }
+
+            if auth != nil {
+                return .json(401, #"{"code":401,"msg":"登录已过期"}"#)
+            }
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"onLessonClassrooms":[{"lessonId":"9001","classroomId":"7001","courseName":"数据结构"}]}}"#
+                )
+            }
+            if path == "/api/v3/lesson/checkin" {
+                return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        let staleAcc = makeAccount(
+            id: "acc-stale-discover",
+            label: "陈同学",
+            bearer: "stale-short-jwt-1",
+            sessionId: "valid-web-sid-1",
+            csrfToken: "valid-web-csrf-1"
+        )
+        try store.addOrUpdateAccount(staleAcc)
+
+        // 无 lessonId 的动态码 -> 先触发 discoverActiveLesson（401 -> 纯 Cookie 重试 200 -> 后续 checkin 直接纯 Cookie）
+        store.applyQrInput("c=dyn1&t=1763900000&s=sig1")
+        store.startCheckIn()
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        let result = try XCTUnwrap(store.results.first)
+        XCTAssertEqual(result.state, .success)
+        XCTAssertEqual(result.attempts.filter { $0.strategyId == "DISCOVER_ACTIVE_LESSON" }.count, 2)
+
+        let reqs = recorded.get()
+        XCTAssertEqual(reqs.count, 3)
+        XCTAssertEqual(reqs[0].path, "/api/v3/classroom/on-lesson-upcoming-exam")
+        XCTAssertEqual(reqs[0].auth, "Bearer stale-short-jwt-1")
+        XCTAssertEqual(reqs[1].path, "/api/v3/classroom/on-lesson-upcoming-exam")
+        XCTAssertNil(reqs[1].auth, "activeLesson 纯 Cookie 回退不得携带过期 Authorization")
+        XCTAssertTrue(reqs[1].cookie?.contains("sessionid=valid-web-sid-1") == true)
+        XCTAssertEqual(reqs[2].path, "/api/v3/lesson/checkin")
+        XCTAssertNil(reqs[2].auth, "清除过期 bearer 后后续 checkin 必须直接纯 Cookie 发送")
+
+        let updatedAccount = try XCTUnwrap(store.accounts.first(where: { $0.id == "acc-stale-discover" }))
+        XCTAssertNil(updatedAccount.bearer, "AppStore 应同步清空已过期的 bearer")
+        XCTAssertEqual(updatedAccount.sessionId, "valid-web-sid-1")
+        XCTAssertNil(vault.load().first?.bearer, "Vault 应持久化清空后的 bearer")
+    }
+
+    @MainActor
+    func testStaleBearerFallsBackToCookieOnlyInExecuteStrategyAndHandlesBusinessCode401() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+
+        // 1) classify 与 discoverActiveLesson 均将 businessCode == 401（即使消息不含 authKeywords）判为 .authExpired
+        let classifier = makeOrchestrator(profile: profile) { _ in
+            .json(200, #"{"code":401,"msg":"expired"}"#)
+        }
+        XCTAssertEqual(
+            classifier.classify(httpStatus: 200, businessCode: 401, message: "expired", bodyText: ""),
+            .authExpired
+        )
+        XCTAssertEqual(
+            classifier.classify(httpStatus: 200, businessCode: 401, message: nil, bodyText: #"{"code":401}"#),
+            .authExpired
+        )
+        let discover401Res = await classifier.checkIn(
+            account: makeAccount(bearer: nil, sessionId: "expired-only-sid"),
+            ticket: QrCodeParser.parse("c=code401&t=1763900000&s=sig", profile: profile)
+        )
+        XCTAssertEqual(discover401Res.state, .authExpired)
+
+        // 2) executeStrategy 命中 businessCode == 401 时，若同时持有 bearer 与 sessionId，单次回退纯 Cookie 并清除失效 bearer
+        let vault = InMemoryAccountVault()
+        let seenAuths = LockedBox<[String?]>([])
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request)
+            seenAuths.withLock { $0.append(auth) }
+            if auth != nil {
+                return .json(200, #"{"code":401,"msg":"expired"}"#)
+            }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        let staleAcc = makeAccount(
+            id: "acc-stale-strategy",
+            label: "林同学",
+            bearer: "stale-jwt-strategy",
+            sessionId: "valid-sid-strategy",
+            csrfToken: "valid-csrf-strategy"
+        )
+        try store.addOrUpdateAccount(staleAcc)
+
+        store.applyQrInput("c=dyn2&t=1763900000&s=sig2&lessonId=8899")
+        store.startCheckIn()
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        let result = try XCTUnwrap(store.results.first)
+        XCTAssertEqual(result.state, .success)
+        XCTAssertEqual(seenAuths.get(), ["Bearer stale-jwt-strategy", nil])
+        XCTAssertEqual(result.attempts.count, 2)
+        let refreshed = try XCTUnwrap(result.refreshedAccount, "纯 Cookie 回退成功后必须回传 refreshedAccount 以清理旧 bearer")
+        XCTAssertNil(refreshed.bearer)
+        XCTAssertEqual(refreshed.sessionId, "valid-sid-strategy")
+        XCTAssertNil(store.accounts.first?.bearer)
+        XCTAssertNil(vault.load().first?.bearer)
+    }
+
+    // MARK: - B5 Discover NetworkError Fallback, DryRun Separation & Retry Binding
+
+    func testDiscoverSuccessFollowedByAllNetworkErrorsClassifiesAsNetworkError() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let orchestrator = makeOrchestrator(profile: profile, maxAttemptsPerStrategy: 1, baseBackoffMs: 0) { request in
+            if request.url?.path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"onLessonClassrooms":[{"lessonId":"555","classroomId":"666","courseName":"概率论"}]}}"#
+                )
+            }
+            throw NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorNetworkConnectionLost,
+                userInfo: [NSLocalizedDescriptionKey: "The network connection was lost."]
+            )
+        }
+
+        // 无 lessonId 且 URL 为非白名单域名：activeLesson 成功 + 全部 HTTP 签到策略网络异常 + 尾部 QR_URL_* 本地安全拦截
+        let ticket = QrCodeParser.parse(
+            "https://evil.example/steal?c=netfail&t=1763900000&s=sig",
+            profile: profile
+        )
+        let result = await orchestrator.checkIn(account: makeAccount(), ticket: ticket)
+
+        XCTAssertEqual(result.state, .networkError, "排除 DISCOVER_ACTIVE_LESSON 后所有 HTTP 策略均为网络异常时应判为 .networkError")
+        XCTAssertTrue(result.attempts.contains { $0.strategyId == "DISCOVER_ACTIVE_LESSON" && $0.httpStatus == 200 })
+        XCTAssertTrue(result.attempts.contains { $0.strategyId == "QR_URL_POST" && $0.httpStatus == nil })
+    }
+
+    @MainActor
+    func testAppStoreRetryFailedUsesLastBatchTicketAndForcesRealCheckIn() async throws {
+        struct CapturedCall: Sendable {
+            let auth: String
+            let lessonId: String
+        }
+
+        XCTAssertFalse(SignState.dryRun.isSuccessLike)
+        XCTAssertTrue(SignState.dryRun.isDryRun)
+        XCTAssertFalse(SignState.dryRun.isFailureLike)
+        XCTAssertTrue(SignState.success.isSuccessLike)
+        XCTAssertTrue(SignState.already.isSuccessLike)
+        XCTAssertFalse(SignState.success.isFailureLike)
+        XCTAssertTrue(SignState.failed.isFailureLike)
+        XCTAssertTrue(SignState.networkError.isFailureLike)
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let shouldFailAcc2 = LockedBox(true)
+        let seenCalls = LockedBox<[CapturedCall]>([])
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            let body = MockNetworkSupport.requestBodyJSON(from: request)
+            let lessonId = body?["lessonId"]?.stringValue ?? ""
+            seenCalls.withLock { $0.append(CapturedCall(auth: auth, lessonId: lessonId)) }
+
+            if auth == "Bearer tok-acc-2" && shouldFailAcc2.get() {
+                return .json(200, #"{"code":40002,"msg":"临时失败"}"#)
+            }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-acc-1"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-2", label: "账号2", bearer: "tok-acc-2"))
+
+        // 1) 使用 Ticket A (lessonId=1111) 执行真实签到：acc-1 成功，acc-2 失败
+        store.applyQrInput("lessonId=1111")
+        let ticketA = try XCTUnwrap(store.currentTicket)
+        store.startCheckIn()
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.lastBatchTicket, ticketA)
+        XCTAssertEqual(store.results.first(where: { $0.accountId == "acc-1" })?.state, .success)
+        XCTAssertEqual(store.results.first(where: { $0.accountId == "acc-2" })?.state, .failed)
+
+        // 2) 切换 currentTicket 为 Ticket B (lessonId=2222) 并打开 dryRun 开关
+        store.applyQrInput("lessonId=2222")
+        let ticketB = try XCTUnwrap(store.currentTicket)
+        store.dryRun = true
+        shouldFailAcc2.set(false)
+        seenCalls.set([])
+
+        // 3) retryFailed 必须使用 lastBatchTicket (1111) 且强制 dryRun=false 仅重试失败账号 acc-2
+        store.retryFailed()
+        ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(store.currentTicket, ticketB, "retryFailed 不得覆盖 currentTicket")
+        XCTAssertTrue(store.dryRun, "retryFailed 不得修改全局 dryRun 开关")
+        XCTAssertEqual(store.results.first(where: { $0.accountId == "acc-2" })?.state, .success)
+        let retryCalls = seenCalls.get()
+        XCTAssertEqual(retryCalls.count, 1)
+        XCTAssertEqual(retryCalls.first?.auth, "Bearer tok-acc-2")
+        XCTAssertEqual(retryCalls.first?.lessonId, "1111", "retryFailed 必须绑定上一批次的 Ticket A (lessonId=1111)")
+
+        // 4) 演练批次结果绝不被 retryFailed 当作失败项触发真实网络请求
+        seenCalls.set([])
+        store.startCheckIn() // dryRun == true
+        ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(store.results.allSatisfy { $0.state == .dryRun })
+        store.retryFailed()
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertTrue(seenCalls.get().isEmpty, "演练结果不应被 retryFailed 误判为失败项")
+    }
+
+    // MARK: - B6 Stagger Across Queued Batch Accounts
+
+    func testCheckInBatchAppliesStaggerAcrossQueuedAccountsBeyondConcurrencyLimit() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let batchStartedMs = RainCheckTime.nowMillis()
+        let orchestrator = makeOrchestrator(
+            profile: profile,
+            maxAttemptsPerStrategy: 1,
+            baseBackoffMs: 0,
+            staggerMs: 50
+        ) { _ in
+            .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let accounts = (0..<4).map { idx in
+            makeAccount(id: "stagger-\(idx)", label: "账号\(idx)", bearer: "tok-\(idx)")
+        }
+        let results = await orchestrator.checkInBatch(
+            accounts: accounts,
+            ticket: QrCodeParser.parse("lessonId=3030", profile: profile),
+            dryRun: false,
+            maxConcurrency: 2
+        )
+        let elapsedMs = RainCheckTime.nowMillis() - batchStartedMs
+
+        XCTAssertEqual(results.map(\.accountId), ["stagger-0", "stagger-1", "stagger-2", "stagger-3"])
+        XCTAssertTrue(results.allSatisfy { $0.state == .success })
+        // 4 个账号 staggerMs=50 -> 索引 3 目标延迟 150ms；留 50ms 调度余量断言 >= 100ms
+        XCTAssertGreaterThanOrEqual(elapsedMs, 100, "超过并发上限的后续排队账号也应按索引应用 staggerMs 错峰延迟")
     }
 }

@@ -133,8 +133,8 @@ struct CameraScannerSheet: View {
                                     .font(.subheadline.weight(.semibold))
                             }
                             .foregroundStyle(Color.white)
-                            .padding(.horizontal, 14)
-                            .frame(height: 44)
+                            .padding(.horizontal, 20)
+                            .frame(minWidth: 102, minHeight: 44)
                             .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
@@ -163,7 +163,7 @@ struct CameraScannerSheet: View {
 
                 Spacer()
 
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     if viewModel.canZoom {
                         zoomControlBar
                     }
@@ -173,8 +173,8 @@ struct CameraScannerSheet: View {
                             Text("将雨课堂签到二维码置于框内")
                                 .font(.subheadline.weight(.medium))
                                 .foregroundStyle(Color.white)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 9)
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 10)
                                 .liquidGlassCapsule(interactive: false)
 
                             if let onManualPaste {
@@ -183,10 +183,12 @@ struct CameraScannerSheet: View {
                                     onManualPaste()
                                 } label: {
                                     Label("粘贴链接", systemImage: "doc.on.clipboard")
-                                        .font(.subheadline.weight(.medium))
+                                        .font(.body.weight(.medium))
                                         .foregroundStyle(Color.white)
-                                        .padding(.horizontal, 16)
-                                        .padding(.vertical, 10)
+                                        .padding(.horizontal, LiquidMetrics.buttonHorizontalPadding)
+                                        .padding(.vertical, LiquidMetrics.buttonVerticalPadding)
+                                        .frame(minWidth: 188, minHeight: LiquidMetrics.buttonMinHeight)
+                                        .contentShape(Capsule())
                                 }
                                 .buttonStyle(.plain)
                                 .liquidGlassCapsule(interactive: true)
@@ -201,53 +203,66 @@ struct CameraScannerSheet: View {
     }
 
     private var zoomControlBar: some View {
-        LiquidGlassGroup(spacing: 8) {
-            VStack(spacing: 8) {
-                if viewModel.shouldShowLiveZoomBadge {
-                    let liveText = formattedZoomLabel(viewModel.currentZoomFactor, alwaysShowDecimal: true)
-                    Text(liveText)
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(LiquidPalette.accent)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .liquidGlassCapsule(interactive: false)
-                        .transition(.opacity.combined(with: .scale(scale: 0.92)))
-                        .accessibilityLabel("当前缩放倍率 \(liveText)")
-                }
-
-                HStack(spacing: 4) {
-                    ForEach(viewModel.availableZoomPresets, id: \.self) { preset in
-                        let isSelected = viewModel.matchedZoomPreset == preset
-                        let label = formattedZoomLabel(preset, alwaysShowDecimal: false)
-
-                        Button {
-                            viewModel.selectZoomPreset(preset)
-                        } label: {
-                            Text(label)
-                                .font(.caption.weight(isSelected ? .bold : .semibold).monospacedDigit())
-                                .foregroundStyle(isSelected ? LiquidPalette.accent : Color.white.opacity(0.86))
-                                .frame(minWidth: 38, minHeight: 32)
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .background {
-                            if isSelected {
-                                Capsule()
-                                    .fill(Color.clear)
-                                    .liquidGlassCapsule(interactive: true)
-                                    .liquidGlassID("scanner.zoom.active", in: zoomGlassNamespace)
-                            }
-                        }
-                        .accessibilityLabel("缩放至 \(label)")
-                        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        VStack(spacing: 8) {
+            if viewModel.shouldShowLiveZoomBadge {
+                let liveText = formattedZoomLabel(viewModel.currentZoomFactor, alwaysShowDecimal: true)
+                Text(liveText)
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(LiquidPalette.darkChromeTrackSurface(), in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75)
+                            .allowsHitTesting(false)
                     }
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .accessibilityLabel("当前缩放倍率 \(liveText)")
+            }
+
+            HStack(spacing: 4) {
+                ForEach(viewModel.availableZoomPresets, id: \.self) { preset in
+                    let isSelected = viewModel.matchedZoomPreset == preset
+                    let label = formattedZoomLabel(preset, alwaysShowDecimal: false)
+
+                    Button {
+                        viewModel.selectZoomPreset(preset)
+                    } label: {
+                        Text(label)
+                            .font(.subheadline.weight(isSelected ? .bold : .semibold).monospacedDigit())
+                            .foregroundStyle(
+                                isSelected
+                                    ? LiquidPalette.darkChromeSelectedForeground()
+                                    : Color.white.opacity(0.92)
+                            )
+                            .lineLimit(1)
+                            .padding(.horizontal, 10)
+                            .frame(
+                                minWidth: LiquidMetrics.dockItemMinWidth,
+                                minHeight: LiquidMetrics.dockItemMinHeight
+                            )
+                            .background {
+                                if isSelected {
+                                    LiquidSelectionPill(tone: .darkOverlay)
+                                        .matchedGeometryEffect(id: "scanner.zoom.active", in: zoomGlassNamespace)
+                                }
+                            }
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .zIndex(isSelected ? 0 : 1)
+                    .accessibilityLabel("缩放至 \(label)")
+                    .accessibilityAddTraits(isSelected ? [.isSelected] : [])
                 }
-                .padding(4)
-                .background(Color.black.opacity(0.42), in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.5)
-                }
+            }
+            .padding(4)
+            .frame(minHeight: LiquidMetrics.dockControlMinHeight)
+            .background(LiquidPalette.darkChromeTrackSurface(), in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.75)
+                    .allowsHitTesting(false)
             }
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: viewModel.matchedZoomPreset)
@@ -267,8 +282,8 @@ struct CameraScannerSheet: View {
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(usesDarkChrome ? Color.white : LiquidPalette.primaryText)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 11)
                 .liquidGlassCapsule(interactive: false)
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 .accessibilityLabel("正在识别图片中的二维码")
@@ -288,9 +303,22 @@ struct CameraScannerSheet: View {
     }
 
     private var viewfinderFrame: some View {
-        RoundedRectangle(cornerRadius: 24, style: .continuous)
-            .strokeBorder(Color.white.opacity(0.72), lineWidth: 1.5)
-            .frame(width: 248, height: 248)
+        ZStack {
+            Rectangle()
+                .fill(Color.black.opacity(0.36))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .frame(width: 256, height: 256)
+                        .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.84), lineWidth: 1.75)
+                .frame(width: 256, height: 256)
+                .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 2)
+        }
+        .ignoresSafeArea()
     }
 
     private func fallbackStateView(
@@ -320,9 +348,12 @@ struct CameraScannerSheet: View {
                                 }
                             } label: {
                                 Text("前往系统设置")
-                                    .frame(maxWidth: .infinity)
                             }
-                            .liquidPrimaryButtonStyle()
+                            .liquidPrimaryButtonStyle(
+                                minWidth: nil,
+                                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                                fullWidth: true
+                            )
 
                             fallbackPhotoPickerButton(isPrimary: false)
                         } else {
@@ -335,13 +366,16 @@ struct CameraScannerSheet: View {
                                 onManualPaste()
                             } label: {
                                 Text("改为粘贴链接")
-                                    .frame(maxWidth: .infinity)
                             }
-                            .liquidSecondaryButtonStyle()
+                            .liquidSecondaryButtonStyle(
+                                minWidth: nil,
+                                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                                fullWidth: true
+                            )
                         }
                     }
                 }
-                .frame(maxWidth: 260)
+                .frame(maxWidth: 340)
 
                 Spacer()
             }
@@ -374,14 +408,21 @@ struct CameraScannerSheet: View {
             photoLibrary: .shared()
         ) {
             Label("从相册选择", systemImage: "photo.on.rectangle")
-                .frame(maxWidth: .infinity)
         }
         .disabled(viewModel.isDecodingPhoto)
 
         if isPrimary {
-            picker.liquidPrimaryButtonStyle()
+            picker.liquidPrimaryButtonStyle(
+                minWidth: nil,
+                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                fullWidth: true
+            )
         } else {
-            picker.liquidSecondaryButtonStyle()
+            picker.liquidSecondaryButtonStyle(
+                minWidth: nil,
+                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                fullWidth: true
+            )
         }
     }
 

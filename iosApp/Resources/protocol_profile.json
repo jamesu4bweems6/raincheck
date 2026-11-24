@@ -59,6 +59,30 @@
       "auth": false,
       "note": "外部桌面端脚本推断，未经实网抓包验证"
     },
+    "phoneSendSms": {
+      "method": "POST",
+      "path": "/pc/login/send_sms_login_code/",
+      "body": {
+        "mobile": "{mobile}",
+        "login": true,
+        "ticket": "{ticket}",
+        "randstr": "{randstr}",
+        "hcaptcha_token": "{hcaptchaToken}"
+      },
+      "auth": false,
+      "note": "雨课堂 Web PC 端发送短信验证码接口（保留末尾斜杠；IPA 1.3.6 移动端对应 /api/v3/user/code/send）"
+    },
+    "phoneVerifyLogin": {
+      "method": "POST",
+      "path": "/pc/login/verify_pwd_login/",
+      "body": {
+        "type": "PC",
+        "name": "{mobile}",
+        "pwd": "{code}"
+      },
+      "auth": false,
+      "note": "雨课堂 Web PC 端手机号+短信验证码登录接口（保留末尾斜杠，Set-Cookie 下发 sessionid/csrftoken；IPA 1.3.6 移动端对应 /api/v3/user/login/app）"
+    },
     "activeLesson": {
       "method": "GET",
       "path": "/api/v3/classroom/on-lesson-upcoming-exam",

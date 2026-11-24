@@ -368,7 +368,7 @@ final class RainCheckClient: Sendable {
 
         let origin = Self.sameOrigin(for: url)
         let normalizedHost = url.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let isXuetangX = normalizedHost.contains("xuetangx.com")
+        let isXuetangX = normalizedHost == "xuetangx.com" || normalizedHost.hasSuffix(".xuetangx.com")
         let defaultXtbz = isXuetangX ? "xt" : "ykt"
 
         if !profile.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -674,7 +674,7 @@ final class RainCheckClient: Sendable {
         if let rawSetCookie = stringHeaders["Set-Cookie"] {
             if extractedSessionId == nil {
                 for candidate in acceptedSessionNames where !rejectedCookieNames.contains(candidate.lowercased()) {
-                    if let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: candidate) {
+                    if let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: candidate, allowBareValue: false) {
                         extractedSessionId = cleaned
                         responseCookies[candidate] = cleaned
                         break
@@ -683,7 +683,7 @@ final class RainCheckClient: Sendable {
             }
             if extractedCsrf == nil,
                !rejectedCookieNames.contains(csrfCookieName.lowercased()),
-               let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: csrfCookieName) {
+               let cleaned = CredentialSanitizer.cleanCookieValue(rawSetCookie, key: csrfCookieName, allowBareValue: false) {
                 extractedCsrf = cleaned
                 responseCookies[csrfCookieName] = cleaned
             }

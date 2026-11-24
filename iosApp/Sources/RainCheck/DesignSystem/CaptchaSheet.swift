@@ -9,6 +9,7 @@ struct CaptchaSheet: View {
     let onCancel: () -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var mode: CaptchaMode = .tencent
     @State private var loadState: CaptchaLoadState = .loading
@@ -88,86 +89,135 @@ struct CaptchaSheet: View {
     }
 
     private var fallbackBanner: some View {
-        HStack(spacing: 12) {
-            Text("完成验证后将自动发送短信验证码")
-                .font(.footnote)
-                .foregroundStyle(LiquidPalette.secondaryText)
-                .lineLimit(1)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("完成验证后将自动发送短信验证码")
+                    .font(.footnote)
+                    .foregroundStyle(LiquidPalette.secondaryText)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.88)
 
-            Spacer(minLength: 8)
+                Spacer(minLength: 8)
 
-            Button("切回默认验证") {
-                switchMode(to: .tencent)
+                Button {
+                    switchMode(to: .tencent)
+                } label: {
+                    Text("切回默认验证")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(LiquidPalette.accent)
+                        .lineLimit(1)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .frame(minWidth: 104, minHeight: 34)
+                        .background(
+                            LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                            in: Capsule()
+                        )
+                        .overlay {
+                            Capsule()
+                                .strokeBorder(
+                                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                    lineWidth: 0.75
+                                )
+                                .allowsHitTesting(false)
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             }
-            .font(.footnote.weight(.medium))
-            .foregroundStyle(LiquidPalette.accent)
-            .buttonStyle(.plain)
+            .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
+            .padding(.vertical, 10)
+            .background(LiquidPalette.elevatedSurface(colorScheme))
+
+            Divider()
+                .overlay(LiquidPalette.hairline(colorScheme))
         }
-        .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
-        .padding(.vertical, 10)
     }
 
     private var loadingCard: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             ProgressView()
+                .controlSize(.regular)
                 .tint(LiquidPalette.accent)
+
             Text(mode == .tencent ? "正在加载安全验证…" : "正在加载备用验证…")
-                .font(.subheadline)
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(LiquidPalette.secondaryText)
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 20)
+        .padding(.horizontal, 28)
+        .padding(.vertical, 22)
+        .frame(minWidth: 220)
         .liquidGlassCard()
     }
 
     private func errorCard(message: String) -> some View {
         VStack(spacing: 16) {
             Image(systemName: "shield.slash")
-                .font(.title2)
+                .font(.system(size: 24, weight: .medium))
                 .foregroundStyle(LiquidPalette.secondaryText)
+                .frame(width: 56, height: 56)
+                .background(LiquidPalette.subtleSurface(colorScheme), in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
 
-            Text("安全验证暂不可用")
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(LiquidPalette.primaryText)
+            VStack(spacing: 6) {
+                Text("安全验证暂不可用")
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(LiquidPalette.primaryText)
 
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(LiquidPalette.secondaryText)
-                .multilineTextAlignment(.center)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(LiquidPalette.secondaryText)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-            LiquidGlassGroup(spacing: 10) {
-                VStack(spacing: 10) {
+            LiquidGlassGroup(spacing: 12) {
+                VStack(spacing: 12) {
                     Button {
                         retryCurrentMode()
                     } label: {
-                        Text("重新加载")
-                            .frame(maxWidth: .infinity)
+                        Label("重新加载", systemImage: "arrow.clockwise")
                     }
-                    .liquidPrimaryButtonStyle()
+                    .liquidPrimaryButtonStyle(
+                        minWidth: nil,
+                        horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                        fullWidth: true
+                    )
 
                     if mode == .tencent {
                         Button {
                             switchMode(to: .hcaptchaFallback)
                         } label: {
                             Text("使用备用验证")
-                                .frame(maxWidth: .infinity)
                         }
-                        .liquidSecondaryButtonStyle()
+                        .liquidSecondaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                            fullWidth: true
+                        )
                     } else {
                         Button {
                             switchMode(to: .tencent)
                         } label: {
                             Text("切回腾讯安全验证")
-                                .frame(maxWidth: .infinity)
                         }
-                        .liquidSecondaryButtonStyle()
+                        .liquidSecondaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                            fullWidth: true
+                        )
                     }
                 }
             }
-            .frame(maxWidth: 240)
         }
         .padding(LiquidMetrics.cardPadding)
-        .frame(maxWidth: 320)
+        .frame(maxWidth: 350)
         .liquidGlassCard()
         .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
     }

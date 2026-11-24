@@ -669,6 +669,30 @@ enum ProtocolCatalog {
                 auth: false,
                 note: "外部桌面端脚本推断，未经实网抓包验证"
             ),
+            "phoneSendSms": EndpointSpec(
+                method: "POST",
+                path: "/pc/login/send_sms_login_code/",
+                body: [
+                    "mobile": .string("{mobile}"),
+                    "login": .bool(true),
+                    "ticket": .string("{ticket}"),
+                    "randstr": .string("{randstr}"),
+                    "hcaptcha_token": .string("{hcaptchaToken}")
+                ],
+                auth: false,
+                note: "雨课堂 Web PC 端发送短信验证码接口（保留末尾斜杠；IPA 1.3.6 移动端对应 /api/v3/user/code/send）"
+            ),
+            "phoneVerifyLogin": EndpointSpec(
+                method: "POST",
+                path: "/pc/login/verify_pwd_login/",
+                body: [
+                    "type": .string("PC"),
+                    "name": .string("{mobile}"),
+                    "pwd": .string("{code}")
+                ],
+                auth: false,
+                note: "雨课堂 Web PC 端手机号+短信验证码登录接口（保留末尾斜杠，Set-Cookie 下发 sessionid/csrftoken；IPA 1.3.6 移动端对应 /api/v3/user/login/app）"
+            ),
             "activeLesson": EndpointSpec(
                 method: "GET",
                 path: "/api/v3/classroom/on-lesson-upcoming-exam",

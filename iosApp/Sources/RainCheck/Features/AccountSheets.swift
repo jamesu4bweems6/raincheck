@@ -33,7 +33,14 @@ struct PhoneLoginSheet: View {
     }
 
     private var isUnsupportedEdition: Bool {
-        selectedEdition.host.lowercased().contains("xuetangx.com")
+        let rawHost = selectedEdition.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let host: String
+        if let colonIndex = rawHost.firstIndex(of: ":"), !rawHost.hasPrefix("[") {
+            host = String(rawHost[..<colonIndex])
+        } else {
+            host = rawHost
+        }
+        return host == "xuetangx.com" || host.hasSuffix(".xuetangx.com")
     }
 
     private var isPhoneValid: Bool {
@@ -73,15 +80,27 @@ struct PhoneLoginSheet: View {
                         editionPickerRow
 
                         if isUnsupportedEdition {
-                            HStack(alignment: .top, spacing: 6) {
+                            HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "info.circle")
-                                    .font(.footnote)
+                                    .font(.footnote.weight(.medium))
+                                    .padding(.top, 1)
                                 Text("学堂在线暂不支持此方式，请切换雨课堂站点")
                                     .font(.footnote)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             .foregroundStyle(LiquidPalette.secondaryText)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 11)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 4)
+                            .background(
+                                LiquidPalette.subtleSurface(colorScheme),
+                                in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                                    .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                                    .allowsHitTesting(false)
+                            }
                         }
 
                         credentialsCard
@@ -94,23 +113,31 @@ struct PhoneLoginSheet: View {
                             }
                         } label: {
                             if isSubmittingLogin {
-                                ProgressView()
-                                    .frame(maxWidth: .infinity)
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("正在登录…")
+                                }
                             } else {
                                 Text("登录并保存账号")
-                                    .frame(maxWidth: .infinity)
                             }
                         }
-                        .liquidPrimaryButtonStyle()
+                        .liquidPrimaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                            fullWidth: true
+                        )
                         .disabled(!canSubmitLogin)
 
                         Text("仅支持中国大陆手机号，登录凭据仅保存在本机 Keychain。")
                             .font(.footnote)
                             .foregroundStyle(LiquidPalette.secondaryText)
                             .multilineTextAlignment(.center)
+                            .padding(.horizontal, 8)
                     }
                     .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
-                    .padding(.vertical, 20)
+                    .padding(.top, 18)
+                    .padding(.bottom, LiquidMetrics.scrollBottomPadding)
                 }
                 .scrollDismissesKeyboard(.interactively)
             }
@@ -163,12 +190,20 @@ struct PhoneLoginSheet: View {
     }
 
     private var editionPickerRow: some View {
-        HStack {
-            Text("雨课堂平台")
-                .font(.subheadline)
-                .foregroundStyle(LiquidPalette.secondaryText)
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("雨课堂平台")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(LiquidPalette.primaryText)
 
-            Spacer()
+                Text(selectedEdition.host)
+                    .font(.caption)
+                    .foregroundStyle(LiquidPalette.tertiaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 8)
 
             Picker(
                 "雨课堂平台",
@@ -190,22 +225,23 @@ struct PhoneLoginSheet: View {
             .tint(LiquidPalette.accent)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 13)
         .background(
             LiquidPalette.elevatedSurface(colorScheme),
-            in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+            in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl + 4, style: .continuous)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+        .overlay {
+            RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl + 4, style: .continuous)
                 .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-        )
+                .allowsHitTesting(false)
+        }
     }
 
     private var credentialsCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("手机号")
-                    .font(.caption.weight(.medium))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(LiquidPalette.secondaryText)
 
                 TextField(
@@ -224,20 +260,26 @@ struct PhoneLoginSheet: View {
                 .font(.system(.body, design: .monospaced))
                 .focused($focusedField, equals: .phone)
                 .padding(.horizontal, 14)
-                .padding(.vertical, 12)
+                .padding(.vertical, 13)
                 .background(
                     LiquidPalette.subtleSurface(colorScheme),
                     in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                 )
-                .overlay(
+                .overlay {
                     RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
-                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-                )
+                        .strokeBorder(
+                            focusedField == .phone
+                                ? LiquidPalette.accent.opacity(0.65)
+                                : LiquidPalette.hairline(colorScheme),
+                            lineWidth: focusedField == .phone ? 1.25 : 1
+                        )
+                        .allowsHitTesting(false)
+                }
             }
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("短信验证码")
-                    .font(.caption.weight(.medium))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(LiquidPalette.secondaryText)
 
                 HStack(spacing: 10) {
@@ -257,15 +299,22 @@ struct PhoneLoginSheet: View {
                     .font(.system(.body, design: .monospaced))
                     .focused($focusedField, equals: .smsCode)
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 13)
+                    .frame(minWidth: 0, maxWidth: .infinity)
                     .background(
                         LiquidPalette.subtleSurface(colorScheme),
                         in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                     )
-                    .overlay(
+                    .overlay {
                         RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
-                            .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-                    )
+                            .strokeBorder(
+                                focusedField == .smsCode
+                                    ? LiquidPalette.accent.opacity(0.65)
+                                    : LiquidPalette.hairline(colorScheme),
+                                lineWidth: focusedField == .smsCode ? 1.25 : 1
+                            )
+                            .allowsHitTesting(false)
+                    }
 
                     Button {
                         handleRequestSmsCode()
@@ -273,39 +322,65 @@ struct PhoneLoginSheet: View {
                         if isSendingCode {
                             ProgressView()
                                 .controlSize(.small)
-                                .frame(minWidth: 78)
                         } else if cooldownSeconds > 0 {
-                            Text("\(cooldownSeconds)s")
+                            Text("\(cooldownSeconds)s 后重发")
                                 .font(.subheadline.monospacedDigit().weight(.medium))
-                                .frame(minWidth: 78)
                         } else {
                             Text("获取验证码")
                                 .font(.subheadline.weight(.medium))
-                                .frame(minWidth: 78)
                         }
                     }
-                    .liquidSecondaryButtonStyle()
+                    .liquidSecondaryButtonStyle(
+                        minWidth: 124,
+                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding
+                    )
+                    .layoutPriority(1)
                     .disabled(!canRequestSmsCode)
                 }
             }
 
             if let statusMessage, !statusMessage.isEmpty {
-                Text(statusMessage)
-                    .font(.footnote)
-                    .foregroundStyle(LiquidPalette.secondaryText)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(LiquidPalette.accent)
+                        .padding(.top, 1)
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.14 : 0.08),
+                    in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                )
             }
 
             if let errorMessage, !errorMessage.isEmpty {
-                HStack(alignment: .top, spacing: 6) {
+                HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "info.circle")
-                        .font(.footnote)
+                        .font(.footnote.weight(.medium))
+                        .padding(.top, 1)
                     Text(errorMessage)
                         .font(.footnote)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .foregroundStyle(LiquidPalette.primaryText)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    LiquidPalette.subtleSurface(colorScheme),
+                    in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
             }
         }
         .padding(LiquidMetrics.cardPadding)
@@ -406,12 +481,17 @@ struct ManualImportSheet: View {
     @State private var csrfTokenInput: String
     @State private var errorMessage: String?
 
+    private var availableEditions: [Edition] {
+        store.profile.editions.isEmpty ? Edition.presets : store.profile.editions
+    }
+
     init(store: AppStore, editing: Account? = nil) {
         self.store = store
         self.editing = editing
 
+        let editions = store.profile.editions.isEmpty ? Edition.presets : store.profile.editions
         if let editing {
-            if let matched = Edition.presets.first(where: {
+            if let matched = editions.first(where: {
                 $0.host.caseInsensitiveCompare(editing.host) == .orderedSame &&
                     $0.scheme.caseInsensitiveCompare(editing.scheme) == .orderedSame
             }) {
@@ -428,8 +508,8 @@ struct ManualImportSheet: View {
             _csrfTokenInput = State(initialValue: editing.csrfToken ?? "")
         } else {
             let defaultId = store.profile.defaultEdition
-            let initialId = Edition.presets.first(where: { $0.id == defaultId })?.id
-                ?? Edition.presets.first?.id
+            let initialId = editions.first(where: { $0.id == defaultId })?.id
+                ?? editions.first?.id
                 ?? "www"
             _selectedEditionId = State(initialValue: initialId)
             _customHost = State(initialValue: "")
@@ -446,14 +526,14 @@ struct ManualImportSheet: View {
     }
 
     private var cleanedSessionId: String? {
-        CredentialSanitizer.cleanCookieValue(sessionIdInput, key: "sessionid")
+        CredentialSanitizer.cleanCookieValue(sessionIdInput, key: "sessionid", allowBareValue: true)
     }
 
     private var cleanedCsrfToken: String? {
-        if let direct = CredentialSanitizer.cleanCookieValue(csrfTokenInput, key: "csrftoken") {
+        if let direct = CredentialSanitizer.cleanCookieValue(csrfTokenInput, key: "csrftoken", allowBareValue: true) {
             return direct
         }
-        return CredentialSanitizer.cleanCookieValue(sessionIdInput, key: "csrftoken")
+        return CredentialSanitizer.cleanCookieValue(sessionIdInput, key: "csrftoken", allowBareValue: false)
     }
 
     private var resolvedHostAndScheme: (host: String, scheme: String) {
@@ -462,7 +542,7 @@ struct ManualImportSheet: View {
             let fallbackScheme = editing?.scheme ?? "https"
             return (parsed.host, parsed.scheme ?? fallbackScheme)
         }
-        if let preset = Edition.presets.first(where: { $0.id == selectedEditionId }) {
+        if let preset = availableEditions.first(where: { $0.id == selectedEditionId }) {
             return (preset.host, preset.scheme)
         }
         return ("www.yuketang.cn", "https")
@@ -486,7 +566,7 @@ struct ManualImportSheet: View {
                 Form {
                     Section {
                         Picker("雨课堂平台", selection: $selectedEditionId) {
-                            ForEach(Edition.presets) { edition in
+                            ForEach(availableEditions) { edition in
                                 Text(edition.label).tag(edition.id)
                             }
                             Text("自定义域名").tag(Self.customEditionId)
@@ -494,6 +574,7 @@ struct ManualImportSheet: View {
 
                         if selectedEditionId == Self.customEditionId {
                             TextField("例如：pro.yuketang.cn", text: $customHost)
+                                .font(.system(.body, design: .monospaced))
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .keyboardType(.URL)
@@ -505,54 +586,106 @@ struct ManualImportSheet: View {
                         Text("基本信息")
                     }
                     .listRowBackground(LiquidPalette.elevatedSurface(colorScheme))
+                    .listRowSeparatorTint(LiquidPalette.hairline(colorScheme))
 
                     Section {
-                        HStack(alignment: .top, spacing: 8) {
+                        HStack(alignment: .center, spacing: 10) {
                             TextField("Bearer Token（支持自动清理前缀）", text: $bearerInput, axis: .vertical)
                                 .lineLimit(2...4)
+                                .font(.system(.callout, design: .monospaced))
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
 
                             #if canImport(UIKit)
-                            Button("粘贴") {
+                            Button {
                                 if let pasted = UIPasteboard.general.string {
                                     errorMessage = nil
                                     bearerInput = CredentialSanitizer.cleanBearer(pasted) ?? pasted.trimmingCharacters(in: .whitespacesAndNewlines)
                                 }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "doc.on.clipboard")
+                                    Text("粘贴")
+                                        .lineLimit(1)
+                                }
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(LiquidPalette.accent)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .frame(minWidth: 74, minHeight: 34)
+                                .background(
+                                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                                    in: Capsule()
+                                )
+                                .overlay {
+                                    Capsule()
+                                        .strokeBorder(
+                                            LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                            lineWidth: 0.75
+                                        )
+                                        .allowsHitTesting(false)
+                                }
+                                .contentShape(Capsule())
                             }
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(LiquidPalette.accent)
                             .buttonStyle(.plain)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(1)
                             #endif
                         }
 
-                        HStack(spacing: 8) {
+                        HStack(alignment: .center, spacing: 10) {
                             TextField("sessionid（支持直接粘贴整段 Cookie）", text: $sessionIdInput)
+                                .font(.system(.callout, design: .monospaced))
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
 
                             #if canImport(UIKit)
-                            Button("粘贴") {
+                            Button {
                                 if let pasted = UIPasteboard.general.string {
                                     errorMessage = nil
-                                    if let sid = CredentialSanitizer.cleanCookieValue(pasted, key: "sessionid") {
+                                    if let sid = CredentialSanitizer.cleanCookieValue(pasted, key: "sessionid", allowBareValue: true) {
                                         sessionIdInput = sid
                                     } else {
                                         sessionIdInput = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
                                     }
                                     if csrfTokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                                       let csrf = CredentialSanitizer.cleanCookieValue(pasted, key: "csrftoken") {
+                                       let csrf = CredentialSanitizer.cleanCookieValue(pasted, key: "csrftoken", allowBareValue: false) {
                                         csrfTokenInput = csrf
                                     }
                                 }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "doc.on.clipboard")
+                                    Text("粘贴")
+                                        .lineLimit(1)
+                                }
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(LiquidPalette.accent)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .frame(minWidth: 74, minHeight: 34)
+                                .background(
+                                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                                    in: Capsule()
+                                )
+                                .overlay {
+                                    Capsule()
+                                        .strokeBorder(
+                                            LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                            lineWidth: 0.75
+                                        )
+                                        .allowsHitTesting(false)
+                                }
+                                .contentShape(Capsule())
                             }
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(LiquidPalette.accent)
                             .buttonStyle(.plain)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(1)
                             #endif
                         }
 
                         TextField("csrftoken（可选）", text: $csrfTokenInput)
+                            .font(.system(.callout, design: .monospaced))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                     } header: {
@@ -575,8 +708,38 @@ struct ManualImportSheet: View {
                         .padding(.top, 4)
                     }
                     .listRowBackground(LiquidPalette.elevatedSurface(colorScheme))
+                    .listRowSeparatorTint(LiquidPalette.hairline(colorScheme))
+
+                    Section {
+                        Button {
+                            saveAccount()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle.fill")
+                                Text(editing == nil ? "保存并导入账号" : "保存修改")
+                            }
+                        }
+                        .liquidPrimaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                            fullWidth: true
+                        )
+                        .disabled(validationError != nil)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(
+                            EdgeInsets(
+                                top: 10,
+                                leading: 0,
+                                bottom: LiquidMetrics.scrollBottomPadding,
+                                trailing: 0
+                            )
+                        )
+                        .listRowSeparator(.hidden)
+                    }
+                    .listSectionSeparator(.hidden)
                 }
                 .scrollContentBackground(.hidden)
+                .scrollDismissesKeyboard(.interactively)
             }
             .navigationTitle(editing == nil ? "手动导入" : "编辑账号")
             .navigationBarTitleDisplayMode(.inline)

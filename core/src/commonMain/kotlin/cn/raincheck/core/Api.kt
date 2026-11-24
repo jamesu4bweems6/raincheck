@@ -152,7 +152,10 @@ class RainCheckApi(
             else -> rawHostPort
         }
         val origin = if (scheme != null && normalizedHostPort != null) "$scheme://$normalizedHostPort" else null
-        val isXuetangX = normalizedHostPort?.contains("xuetangx.com", ignoreCase = true) == true
+        val host = normalizedHostPort?.let { hp ->
+            if (hp.startsWith("[")) hp.substringBefore(']') + "]" else hp.substringBefore(':')
+        }?.lowercase()
+        val isXuetangX = host == "xuetangx.com" || host?.endsWith(".xuetangx.com") == true
         val defaultXtbz = if (isXuetangX) "xt" else "ykt"
 
         val response: HttpResponse = try {

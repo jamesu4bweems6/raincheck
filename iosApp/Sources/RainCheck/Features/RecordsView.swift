@@ -35,16 +35,34 @@ struct RecordsView: View {
         case .succeeded:
             return store.results.filter { $0.state.isSuccessLike }
         case .failed:
-            return store.results.filter { !$0.state.isSuccessLike }
+            return store.results.filter { $0.state.isFailureLike }
         }
     }
 
+    private var succeededCount: Int {
+        store.results.filter { $0.state.isSuccessLike }.count
+    }
+
     private var failedCount: Int {
-        store.results.filter { !$0.state.isSuccessLike }.count
+        store.results.filter { $0.state.isFailureLike }.count
     }
 
     private var canRetryFailed: Bool {
-        failedCount > 0 && store.currentTicket != nil
+        failedCount > 0 && store.lastBatchTicket != nil
+    }
+
+    private func filterLabel(for option: RecordFilter) -> String {
+        guard !store.results.isEmpty else {
+            return option.rawValue
+        }
+        switch option {
+        case .all:
+            return "\(option.rawValue) \(store.results.count)"
+        case .succeeded:
+            return "\(option.rawValue) \(succeededCount)"
+        case .failed:
+            return "\(option.rawValue) \(failedCount)"
+        }
     }
 
     private var exportItem: SanitizedReportExportItem {
@@ -67,7 +85,7 @@ struct RecordsView: View {
                             options: RecordFilter.allCases,
                             selection: $filter
                         ) { option in
-                            option.rawValue
+                            filterLabel(for: option)
                         }
 
                         if canRetryFailed {
@@ -75,9 +93,12 @@ struct RecordsView: View {
                                 store.retryFailed()
                             } label: {
                                 Label("重试失败项（\(failedCount)）", systemImage: "arrow.clockwise")
-                                    .frame(maxWidth: .infinity)
                             }
-                            .liquidSecondaryButtonStyle()
+                            .liquidSecondaryButtonStyle(
+                                minWidth: nil,
+                                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                                fullWidth: true
+                            )
                             .disabled(store.isCheckingIn)
                         }
 
@@ -89,7 +110,7 @@ struct RecordsView: View {
                                     ? "完成签到或演练后，这里会展示各账号的状态与链路详情。"
                                     : "切换上方筛选条件查看其他结果。"
                             )
-                            .padding(.top, 36)
+                            .padding(.top, 28)
                         } else {
                             LazyVStack(spacing: 12) {
                                 ForEach(filteredResults) { result in
@@ -99,7 +120,8 @@ struct RecordsView: View {
                         }
                     }
                     .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
-                    .padding(.vertical, 16)
+                    .padding(.top, 14)
+                    .padding(.bottom, LiquidMetrics.scrollBottomPadding)
                 }
             }
             .navigationTitle("记录")
@@ -113,6 +135,7 @@ struct RecordsView: View {
                                     preview: SharePreview("雨课堂签到记录.json")
                                 ) {
                                     Image(systemName: "square.and.arrow.up")
+                                        .frame(minWidth: 30, minHeight: 30)
                                         .accessibilityLabel("导出脱敏记录")
                                 }
 
@@ -120,6 +143,7 @@ struct RecordsView: View {
                                     showClearConfirmation = true
                                 } label: {
                                     Image(systemName: "trash")
+                                        .frame(minWidth: 30, minHeight: 30)
                                         .accessibilityLabel("清空记录")
                                 }
                             }
@@ -143,6 +167,7 @@ struct RecordsView: View {
 
     private func resultRow(_ result: SignResult) -> some View {
         let isExpanded = expandedResultIds.contains(result.id)
+        let isSuccessLike = result.state.isSuccessLike
 
         return VStack(alignment: .leading, spacing: 0) {
             Button {
@@ -156,13 +181,29 @@ struct RecordsView: View {
             } label: {
                 HStack(alignment: .center, spacing: 12) {
                     Image(systemName: result.state.symbolName)
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(result.state.isSuccessLike ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
-                        .frame(width: 24)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(isSuccessLike ? LiquidPalette.accent : LiquidPalette.secondaryText)
+                        .frame(width: 34, height: 34)
+                        .background(
+                            isSuccessLike
+                                ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                                : LiquidPalette.subtleSurface(colorScheme),
+                            in: Circle()
+                        )
+                        .overlay {
+                            Circle()
+                                .strokeBorder(
+                                    isSuccessLike
+                                        ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20)
+                                        : LiquidPalette.hairline(colorScheme),
+                                    lineWidth: 0.75
+                                )
+                                .allowsHitTesting(false)
+                        }
 
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(result.accountLabel)
-                            .font(.subheadline.weight(.medium))
+                            .font(.subheadline.weight(.semibold))
                             .foregroundStyle(LiquidPalette.primaryText)
                             .lineLimit(1)
 
@@ -174,11 +215,14 @@ struct RecordsView: View {
 
                     Spacer(minLength: 8)
 
-                    VStack(alignment: .trailing, spacing: 4) {
+                    VStack(alignment: .trailing, spacing: 6) {
                         Text("\(result.elapsedMs) ms")
-                            .font(.system(.caption, design: .monospaced))
+                            .font(.system(.caption2, design: .monospaced).weight(.medium))
                             .monospacedDigit()
                             .foregroundStyle(LiquidPalette.secondaryText)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
 
                         Image(systemName: "chevron.down")
                             .font(.caption2.weight(.semibold))
@@ -206,10 +250,11 @@ struct RecordsView: View {
             LiquidPalette.elevatedSurface(colorScheme),
             in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
         )
-        .overlay(
+        .overlay {
             RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
                 .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-        )
+                .allowsHitTesting(false)
+        }
     }
 
     private func summarySubtitle(for result: SignResult) -> String {
@@ -222,16 +267,27 @@ struct RecordsView: View {
 
     private func attemptTraceSection(_ result: SignResult) -> some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !result.host.isEmpty {
+                HStack(spacing: 6) {
+                    Text("\(LiquidPalette.editionDisplayName(forHost: result.host)) · \(result.host)")
+                        .font(.caption2)
+                        .foregroundStyle(LiquidPalette.tertiaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                }
+            }
+
             if result.attempts.isEmpty {
                 Text("无网络请求链路（\(result.state.displayTitle)）")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(LiquidPalette.tertiaryText)
             } else {
                 ForEach(Array(result.attempts.enumerated()), id: \.offset) { _, attempt in
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 4) {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text("\(attempt.strategyId) · \(attempt.method)")
-                                .font(.system(.caption, design: .monospaced).weight(.medium))
+                                .font(.system(.caption, design: .monospaced).weight(.semibold))
                                 .foregroundStyle(LiquidPalette.primaryText)
 
                             Spacer(minLength: 6)
@@ -255,12 +311,17 @@ struct RecordsView: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
-                    .padding(10)
+                    .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(
                         LiquidPalette.subtleSurface(colorScheme),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
                     )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
+                            .allowsHitTesting(false)
+                    }
                 }
             }
         }

@@ -64,7 +64,6 @@ final class PhoneLoginClientTests: XCTestCase {
         }
 
         XCTAssertEqual(PhoneLoginClient.tencentCaptchaAppId, "2091064951")
-        XCTAssertEqual(PhoneLoginClient.hcaptchaSiteKey, "50f6f060-c606-4e3b-b6e8-ca3b706b61e1")
 
         let profile = try TestBundleResources.loadProtocolProfile()
         for editionId in ["www", "pro", "changjiang", "huanghe"] {
@@ -859,5 +858,247 @@ final class PhoneLoginClientTests: XCTestCase {
         XCTAssertEqual(preserved.label, "我的主号")
         XCTAssertEqual(preserved.userId, "u-9000")
         XCTAssertNotNil(preserved.lastOkAt)
+    }
+
+    // MARK: - B1 Strict Named Cookie Extraction & Set-Cookie Isolation
+
+    func testCredentialSanitizerStrictNamedExtractionPreventsCrossFieldAndSetCookiePoisoning() async throws {
+        // 1) 裸 sessionid 绝不可在 allowBareValue: false 下填进 csrftoken
+        XCTAssertEqual(
+            CredentialSanitizer.cleanCookieValue("raw_sid_token_123", key: "sessionid", allowBareValue: true),
+            "raw_sid_token_123"
+        )
+        XCTAssertNil(
+            CredentialSanitizer.cleanCookieValue("raw_sid_token_123", key: "sessionid", allowBareValue: false)
+        )
+        XCTAssertNil(
+            CredentialSanitizer.cleanCookieValue("raw_sid_token_123", key: "csrftoken", allowBareValue: false)
+        )
+
+        // 2) 无关的 key2=val Cookie（如 lang=zh / route=node1）无论 allowBareValue 为何值都绝不匹配
+        for unrelated in ["lang=zh", "route=node1", "lang=zh; Path=/", "Set-Cookie: lang=zh", "Set-Cookie: foo; Path=/", "foo; Path=/"] {
+            XCTAssertNil(
+                CredentialSanitizer.cleanCookieValue(unrelated, key: "sessionid", allowBareValue: false),
+                "allowBareValue=false 不应误提取无关 Cookie: \(unrelated)"
+            )
+            XCTAssertNil(
+                CredentialSanitizer.cleanCookieValue(unrelated, key: "csrftoken", allowBareValue: false),
+                "allowBareValue=false 不应误提取无关 Cookie: \(unrelated)"
+            )
+            XCTAssertNil(
+                CredentialSanitizer.cleanCookieValue(unrelated, key: "sessionid", allowBareValue: true),
+                "allowBareValue=true 也不应误提取无关键值对或带属性片段: \(unrelated)"
+            )
+            XCTAssertNil(
+                CredentialSanitizer.cleanCookieValue(unrelated, key: "csrftoken", allowBareValue: true),
+                "allowBareValue=true 也不应误提取无关键值对或带属性片段: \(unrelated)"
+            )
+        }
+
+        // 3) 具名 Cookie 在 allowBareValue: false 下准确提取
+        let pair = "sessionid=sid_exact_1; csrftoken=csrf_exact_2"
+        XCTAssertEqual(CredentialSanitizer.cleanCookieValue(pair, key: "sessionid", allowBareValue: false), "sid_exact_1")
+        XCTAssertEqual(CredentialSanitizer.cleanCookieValue(pair, key: "csrftoken", allowBareValue: false), "csrf_exact_2")
+
+        // 4) PhoneLoginClient 收到无关 Set-Cookie: lang=zh 时不得凭空生成 sessionId/csrfToken
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+        let unrelatedLoginClient = makeClient(profile: profile) { _ in
+            .json(
+                200,
+                #"{"success":true,"msg":"","data":{}}"#,
+                headers: ["Set-Cookie": "lang=zh"]
+            )
+        }
+        do {
+            _ = try await unrelatedLoginClient.loginWithSmsCode(
+                edition: edition,
+                phone: "13800138000",
+                code: "654321"
+            )
+            XCTFail("仅返回无关 Set-Cookie: lang=zh 时必须抛出 .missingCredentials")
+        } catch let error as PhoneLoginError {
+            XCTAssertEqual(error, .missingCredentials)
+        }
+
+        // 5) RainCheckClient 收到无关 Set-Cookie: lang=zh 时绝不覆盖既有 sessionId 与 csrfToken
+        let rainSession = MockNetworkSupport.makeSession { _ in
+            .json(
+                200,
+                #"{"code":0,"msg":"","data":{"id":"u-keep","name":"吴同学"}}"#,
+                headers: ["Set-Cookie": "lang=zh"]
+            )
+        }
+        let rainClient = RainCheckClient(session: rainSession, profile: profile)
+        let originalAccount = Account(
+            id: "acc-keep-cookie",
+            label: "吴同学",
+            host: "www.yuketang.cn",
+            scheme: "https",
+            bearer: nil,
+            sessionId: "original-valid-sid",
+            csrfToken: "original-valid-csrf"
+        )
+        let verified = try await rainClient.fetchMe(account: originalAccount)
+        XCTAssertEqual(verified.refreshedAccount?.sessionId, "original-valid-sid")
+        XCTAssertEqual(verified.refreshedAccount?.csrfToken, "original-valid-csrf")
+    }
+
+    // MARK: - B3 Profile-Driven Phone Login Endpoints & B6 Host Suffix Check
+
+    func testPhoneLoginUsesProfileEndpointsAndSupportsCustomAndFallbackProfiles() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+
+        // 1) Bundled profile 与 ProtocolCatalog.fallback 均声明 phoneSendSms / phoneVerifyLogin
+        for candidateProfile in [profile, ProtocolCatalog.fallback] {
+            let smsSpec = try XCTUnwrap(candidateProfile.endpoint("phoneSendSms"))
+            XCTAssertEqual(smsSpec.method, "POST")
+            XCTAssertEqual(smsSpec.path, "/pc/login/send_sms_login_code/")
+            XCTAssertFalse(smsSpec.auth)
+
+            let verifySpec = try XCTUnwrap(candidateProfile.endpoint("phoneVerifyLogin"))
+            XCTAssertEqual(verifySpec.method, "POST")
+            XCTAssertEqual(verifySpec.path, "/pc/login/verify_pwd_login/")
+            XCTAssertFalse(verifySpec.auth)
+        }
+
+        // 2) 自定义 profile endpoints 路径会被 PhoneLoginClient 实际采用
+        var customEndpoints = profile.endpoints
+        customEndpoints["phoneSendSms"] = EndpointSpec(
+            method: "POST",
+            path: "/custom/login/send_sms/",
+            body: [
+                "mobile": .string("{mobile}"),
+                "login": .bool(true),
+                "ticket": .string("{ticket}"),
+                "randstr": .string("{randstr}"),
+                "hcaptcha_token": .string("{hcaptchaToken}")
+            ],
+            auth: false
+        )
+        customEndpoints["phoneVerifyLogin"] = EndpointSpec(
+            method: "POST",
+            path: "/custom/login/verify_sms/",
+            body: [
+                "type": .string("PC"),
+                "name": .string("{mobile}"),
+                "pwd": .string("{code}")
+            ],
+            auth: false
+        )
+        let customProfile = ProtocolProfile(
+            version: profile.version,
+            name: profile.name,
+            updatedAt: profile.updatedAt,
+            defaultEdition: profile.defaultEdition,
+            editions: profile.editions,
+            headers: profile.headers,
+            userAgent: profile.userAgent,
+            auth: profile.auth,
+            endpoints: customEndpoints,
+            strategies: profile.strategies,
+            qr: profile.qr,
+            result: profile.result
+        )
+
+        let customPaths = LockedBox<[String]>([])
+        let customClient = makeClient(profile: customProfile) { request in
+            let path = Self.rawPathPreservingTrailingSlash(of: request)
+            customPaths.withLock { $0.append(path) }
+            switch path {
+            case "/custom/login/send_sms/":
+                return .json(200, #"{"success":true}"#)
+            case "/custom/login/verify_sms/":
+                return .json(
+                    200,
+                    #"{"success":true}"#,
+                    headers: ["Set-Cookie": "sessionid=custom-sid; Path=/"]
+                )
+            case "/api/v3/user/basic-info":
+                return .json(200, #"{"code":0,"data":{"id":"u-custom","name":"郑同学"}}"#)
+            default:
+                return .json(404, #"{"code":40400}"#)
+            }
+        }
+        try await customClient.sendSmsCode(edition: edition, phone: "13800138000", captcha: CaptchaToken(ticket: "t", randstr: "r"))
+        let customAccount = try await customClient.loginWithSmsCode(edition: edition, phone: "13800138000", code: "123456")
+        XCTAssertEqual(customAccount.sessionId, "custom-sid")
+        XCTAssertTrue(customPaths.get().contains("/custom/login/send_sms/"))
+        XCTAssertTrue(customPaths.get().contains("/custom/login/verify_sms/"))
+
+        // 3) 缺失 phoneSendSms/phoneVerifyLogin 的旧 profile 应无缝回退默认端点
+        let strippedProfile = ProtocolProfile(
+            version: profile.version,
+            name: profile.name,
+            updatedAt: profile.updatedAt,
+            defaultEdition: profile.defaultEdition,
+            editions: profile.editions,
+            headers: profile.headers,
+            userAgent: profile.userAgent,
+            auth: profile.auth,
+            endpoints: ["me": try XCTUnwrap(profile.endpoint("me"))],
+            strategies: profile.strategies,
+            qr: profile.qr,
+            result: profile.result
+        )
+        let fallbackPathSeen = LockedBox<String?>(nil)
+        let fallbackClient = makeClient(profile: strippedProfile) { request in
+            fallbackPathSeen.set(Self.rawPathPreservingTrailingSlash(of: request))
+            return .json(200, #"{"success":true}"#)
+        }
+        try await fallbackClient.sendSmsCode(edition: edition, phone: "13800138000", captcha: CaptchaToken(ticket: "t", randstr: "r"))
+        XCTAssertEqual(fallbackPathSeen.get(), "/pc/login/send_sms_login_code/")
+    }
+
+    func testXuetangXExactAndSuffixHostMatchRejectsSpoofedHosts() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let captcha = CaptchaToken(ticket: "t", randstr: "r")
+
+        // 1) 精确域名 xuetangx.com 与子域名 www.xuetangx.com 应被 PhoneLoginClient 拒绝，而伪造域名不应被误判
+        let seenHosts = LockedBox<[String]>([])
+        let phoneClient = makeClient(profile: profile) { request in
+            seenHosts.withLock { $0.append(request.url?.host?.lowercased() ?? "") }
+            return .json(200, #"{"success":true}"#)
+        }
+
+        for blockedHost in ["xuetangx.com", "www.xuetangx.com", "www.xuetangx.com:443"] {
+            let blockedEdition = Edition(id: "xt", label: "学堂在线", host: blockedHost, scheme: "https")
+            do {
+                try await phoneClient.sendSmsCode(edition: blockedEdition, phone: "13800138000", captcha: captcha)
+                XCTFail("\(blockedHost) 应抛出 .unsupportedEdition")
+            } catch let error as PhoneLoginError {
+                guard case .unsupportedEdition = error else {
+                    XCTFail("\(blockedHost) 预期 .unsupportedEdition，实际为 \(error)")
+                    return
+                }
+            }
+        }
+        XCTAssertTrue(seenHosts.get().isEmpty)
+
+        for spoofedHost in ["fakexuetangx.com", "xuetangx.com.evil.example"] {
+            let spoofedEdition = Edition(id: "custom", label: "Custom", host: spoofedHost, scheme: "https")
+            try await phoneClient.sendSmsCode(edition: spoofedEdition, phone: "13800138000", captcha: captcha)
+        }
+        XCTAssertEqual(seenHosts.get(), ["fakexuetangx.com", "xuetangx.com.evil.example"])
+
+        // 2) RainCheckClient 仅对 xuetangx.com 及 *.xuetangx.com 发送 xtbz: xt，其余发送 xtbz: ykt
+        let capturedXtbz = LockedBox<[String: String]>([:])
+        let rainSession = MockNetworkSupport.makeSession { request in
+            let host = request.url?.host?.lowercased() ?? ""
+            let xtbz = MockNetworkSupport.headerValue("xtbz", in: request) ?? ""
+            capturedXtbz.withLock { $0[host] = xtbz }
+            return .json(200, #"{"code":0,"data":{"id":"u1","name":"测试"}}"#)
+        }
+        let rainClient = RainCheckClient(session: rainSession, profile: profile)
+        for host in ["xuetangx.com", "www.xuetangx.com", "fakexuetangx.com", "xuetangx.com.evil.example"] {
+            let acc = Account(id: "acc-\(host)", label: host, host: host, scheme: "https", sessionId: "sid-1")
+            _ = try await rainClient.fetchMe(account: acc)
+        }
+        let xtbzMap = capturedXtbz.get()
+        XCTAssertEqual(xtbzMap["xuetangx.com"], "xt")
+        XCTAssertEqual(xtbzMap["www.xuetangx.com"], "xt")
+        XCTAssertEqual(xtbzMap["fakexuetangx.com"], "ykt")
+        XCTAssertEqual(xtbzMap["xuetangx.com.evil.example"], "ykt")
     }
 }

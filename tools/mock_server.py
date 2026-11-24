@@ -2,7 +2,8 @@
 """RainCheck 本地演练服务端（零依赖，仅标准库）。
 
 用于离线全链路验证：
-  1. 扫码登录：pre-info / wait-for-scan / login / login-with-code / basic-info
+  1. 登录：扫码登录（pre-info / wait-for-scan / login / login-with-code）与
+     Web 手机短信登录（/pc/login/send_sms_login_code/、/pc/login/verify_pwd_login/）及 basic-info
   2. 课堂上下文：on-lesson-upcoming-exam / checkin-list / checkin/detail / lesson/basic-info
   3. 签到：lesson/checkin（支持静态码、动态 ticket/t/s 强校验、source=14 拒绝回退、
      重复签到、过期码、双载体 Bearer + Cookie/CSRF 鉴权、响应头会话刷新）
@@ -10,11 +11,13 @@
      /admin/attend、/admin/state
 
 所有业务响应结构与真实服务保持一致：{"code": 0, "msg": "...", "data": {...}}
+（Web /pc/login/* 接口按官方返回 {"success": true/false, "status_code": ..., "msg": "...", "data": {...}}）
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import threading
 import time
 import uuid
@@ -24,6 +27,8 @@ from urllib.parse import parse_qs, urlparse
 
 STATE_LOCK = threading.Lock()
 CLIENT_DISCONNECT_ERRORS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+MAINLAND_PHONE_RE = re.compile(r"^1[3456789]\d{9}$")
+SMS_CODE_RE = re.compile(r"^\d{4,8}$")
 
 
 class BadJsonError(ValueError):
@@ -51,6 +56,7 @@ class World:
         self.default_login_ttl = login_ttl
         self._ticket_seq = 0
         self._login_seq = 0
+        self._sms_seq = 0
         self._refresh_seq = 0
         self.reset()
 
@@ -90,6 +96,7 @@ class World:
         self.sessions: dict[str, dict[str, Any]] = {}       # token/sid -> user dict
         self.login_flows: dict[str, dict[str, Any]] = {}    # login_token -> flow dict
         self.verify_tokens: dict[str, str] = {}             # verify_token -> login_token
+        self.sms_codes: dict[str, dict[str, Any]] = {}      # mobile -> sms code state
         self.attendance: dict[str, dict[str, Any]] = {}     # uid -> record
 
         self.requests: list[dict[str, Any]] = []
@@ -400,6 +407,10 @@ class Handler(BaseHTTPRequestHandler):
                 if header_err:
                     return self._fail(40010, header_err, status=400)
 
+            if path == "/pc/login/send_sms_login_code/":
+                return self._pc_send_sms(body)
+            if path == "/pc/login/verify_pwd_login/":
+                return self._pc_verify_pwd_login(body)
             if path == "/api/v3/user/login/wait-for-scan":
                 return self._login_wait(body)
             if path == "/api/v3/user/login":
@@ -559,6 +570,90 @@ class Handler(BaseHTTPRequestHandler):
             headers=[
                 ("set-auth", f"Bearer {session_token}"),
                 ("Set-Cookie", f"sessionid={session_token}; Path=/; HttpOnly"),
+                ("Set-Cookie", f"csrftoken={csrf_token}; Path=/"),
+            ],
+        )
+
+    def _pc_send_sms(self, body: dict[str, Any]) -> None:
+        mobile = str(body.get("mobile") or "").strip()
+        if not MAINLAND_PHONE_RE.fullmatch(mobile):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300402, "msg": "无效的手机号格式", "data": {}},
+            )
+        if "login" in body and body["login"] is not True:
+            return self._send(
+                200,
+                {"success": False, "status_code": 300411, "msg": "错误的登录类型", "data": {}},
+            )
+
+        code = "123456"
+        WORLD.sms_codes[mobile] = {
+            "code": code,
+            "issued": time.time(),
+            "ttl": WORLD.login_ttl,
+            "used": False,
+        }
+        return self._send(
+            200,
+            {
+                "success": True,
+                "msg": "验证码已发送",
+                "data": {"mobile": mobile, "code": code},
+            },
+        )
+
+    def _pc_verify_pwd_login(self, body: dict[str, Any]) -> None:
+        login_type = str(body.get("type") or "").strip()
+        if login_type != "PC":
+            return self._send(
+                200,
+                {"success": False, "status_code": 300411, "msg": "错误的登录类型", "data": {}},
+            )
+        mobile = str(body.get("name") or "").strip()
+        if not MAINLAND_PHONE_RE.fullmatch(mobile):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300402, "msg": "无效的手机号格式", "data": {}},
+            )
+        pwd = str(body.get("pwd") or "").strip()
+        if not SMS_CODE_RE.fullmatch(pwd):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300405, "msg": "验证码错误", "data": {}},
+            )
+
+        record = WORLD.sms_codes.get(mobile)
+        if record is None or record.get("used"):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300404, "msg": "验证码已过期或已被使用", "data": {}},
+            )
+        if (time.time() - float(record["issued"])) > float(record["ttl"]):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300404, "msg": "验证码已过期或已被使用", "data": {}},
+            )
+        if pwd != str(record["code"]):
+            return self._send(
+                200,
+                {"success": False, "status_code": 300405, "msg": "验证码错误", "data": {}},
+            )
+
+        record["used"] = True
+        WORLD._sms_seq += 1
+        suffix4 = mobile[-4:]
+        uid = f"phone-{suffix4}"
+        user_name = WORLD.users.get(uid) or f"演练用户({suffix4})"
+        WORLD.users[uid] = user_name
+        session_id = f"sms-sid-{suffix4}-{WORLD._sms_seq:04d}"
+        csrf_token = f"sms-csrf-{suffix4}-{WORLD._sms_seq:04d}"
+        WORLD.sessions[session_id] = {"id": uid, "name": user_name, "csrf": csrf_token}
+        return self._send(
+            200,
+            {"success": True, "msg": "", "data": {"id": uid, "name": user_name}},
+            headers=[
+                ("Set-Cookie", f"sessionid={session_id}; Path=/; HttpOnly"),
                 ("Set-Cookie", f"csrftoken={csrf_token}; Path=/"),
             ],
         )

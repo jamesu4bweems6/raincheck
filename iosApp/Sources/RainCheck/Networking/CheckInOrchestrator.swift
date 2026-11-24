@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 /// 一次签到推断得到的课堂上下文。
@@ -152,30 +153,31 @@ final class CheckInOrchestrator: Sendable {
                 ticket: ticket
             )
             switch outcome {
-            case .found(let ctx, let trace):
-                traces.append(trace)
+            case .found(let ctx, let discoverTraces):
+                traces.append(contentsOf: discoverTraces)
                 context = ctx
-            case .authExpired(let message, let trace):
-                traces.append(trace)
+            case .authExpired(let message, let discoverTraces):
+                traces.append(contentsOf: discoverTraces)
+                let lastDiscover = discoverTraces.last
                 return SignResult(
                     accountId: currentAccount.id,
                     accountLabel: currentAccount.label,
                     host: currentAccount.host,
                     state: .authExpired,
-                    strategyId: trace.strategyId,
-                    httpStatus: trace.httpStatus,
+                    strategyId: lastDiscover?.strategyId,
+                    httpStatus: lastDiscover?.httpStatus,
                     message: message,
                     elapsedMs: max(0, RainCheckTime.nowMillis() - startedMs),
                     attempts: traces,
                     timestampMs: RainCheckTime.nowMillis(),
                     refreshedAccount: credentialsRefreshed ? currentAccount : nil
                 )
-            case .networkError(_, let trace):
-                traces.append(trace)
+            case .networkError(_, let discoverTraces):
+                traces.append(contentsOf: discoverTraces)
                 discoverFailure = outcome
                 context = nil
-            case .notFound(_, let trace):
-                traces.append(trace)
+            case .notFound(_, let discoverTraces):
+                traces.append(contentsOf: discoverTraces)
                 discoverFailure = outcome
                 context = nil
             }
@@ -201,14 +203,14 @@ final class CheckInOrchestrator: Sendable {
             let finalMessage: String
             let lastStatus: Int?
             switch discoverFailure {
-            case .networkError(let msg, let trace):
+            case .networkError(let msg, let discoverTraces):
                 finalState = .networkError
                 finalMessage = msg
-                lastStatus = trace.httpStatus
-            case .notFound(let msg, let trace):
+                lastStatus = discoverTraces.last?.httpStatus
+            case .notFound(let msg, let discoverTraces):
                 finalState = .notInClass
                 finalMessage = msg
-                lastStatus = trace.httpStatus
+                lastStatus = discoverTraces.last?.httpStatus
             default:
                 finalState = .notInClass
                 finalMessage = "无法确定 lessonId，请确认二维码属于进行中的课堂"
@@ -331,7 +333,9 @@ final class CheckInOrchestrator: Sendable {
             }
         }
 
-        let networkTraces = traces.filter { $0.httpStatus != nil }
+        let networkTraces = traces.filter {
+            $0.httpStatus != nil && $0.strategyId != "DISCOVER_ACTIVE_LESSON"
+        }
         let resolvedState: SignState
         if !networkTraces.isEmpty && networkTraces.allSatisfy({ classify(httpStatus: $0.httpStatus, businessCode: $0.businessCode, message: $0.message, bodyText: "") == .networkError }) {
             resolvedState = .networkError
@@ -370,6 +374,7 @@ final class CheckInOrchestrator: Sendable {
         }
 
         let limit = max(1, min(maxConcurrency, 32))
+        let batchStartNs = DispatchTime.now().uptimeNanoseconds
         var orderedResults = Array<SignResult?>(repeating: nil, count: targets.count)
 
         await withTaskGroup(of: (Int, SignResult).self) { group in
@@ -381,10 +386,7 @@ final class CheckInOrchestrator: Sendable {
                 let account = targets[idx]
                 nextIndex += 1
                 group.addTask { [self] in
-                    if !dryRun && self.staggerMs > 0 && idx > 0 {
-                        let delayNs = UInt64(idx) * self.staggerMs * 1_000_000
-                        try? await Task.sleep(nanoseconds: delayNs)
-                    }
+                    await self.applyStaggerDelayIfNeeded(index: idx, dryRun: dryRun, batchStartNs: batchStartNs)
                     let result = await self.checkIn(account: account, ticket: ticket, dryRun: dryRun)
                     return (idx, result)
                 }
@@ -399,6 +401,7 @@ final class CheckInOrchestrator: Sendable {
                     let nextAccount = targets[nextIdx]
                     nextIndex += 1
                     group.addTask { [self] in
+                        await self.applyStaggerDelayIfNeeded(index: nextIdx, dryRun: dryRun, batchStartNs: batchStartNs)
                         let nextResult = await self.checkIn(account: nextAccount, ticket: ticket, dryRun: dryRun)
                         return (nextIdx, nextResult)
                     }
@@ -407,6 +410,15 @@ final class CheckInOrchestrator: Sendable {
         }
 
         return orderedResults.compactMap { $0 }
+    }
+
+    private func applyStaggerDelayIfNeeded(index: Int, dryRun: Bool, batchStartNs: UInt64) async {
+        guard !dryRun, staggerMs > 0, index > 0 else { return }
+        let targetNs = batchStartNs &+ (UInt64(index) * staggerMs * 1_000_000)
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if targetNs > nowNs {
+            try? await Task.sleep(nanoseconds: targetNs - nowNs)
+        }
     }
 
     // MARK: - Classification
@@ -440,6 +452,9 @@ final class CheckInOrchestrator: Sendable {
         if let status = httpStatus, (200...299).contains(status), profile.result.isOkCode(businessCode) {
             return .success
         }
+        if businessCode == 401 {
+            return .authExpired
+        }
         if matchesAnyKeyword(text, keywords: profile.result.authKeywords) {
             return .authExpired
         }
@@ -458,10 +473,38 @@ final class CheckInOrchestrator: Sendable {
     // MARK: - Discovery & Strategy Execution
 
     private enum DiscoverOutcome {
-        case found(LessonContext, AttemptTrace)
-        case authExpired(String, AttemptTrace)
-        case networkError(String, AttemptTrace)
-        case notFound(String, AttemptTrace)
+        case found(LessonContext, [AttemptTrace])
+        case authExpired(String, [AttemptTrace])
+        case networkError(String, [AttemptTrace])
+        case notFound(String, [AttemptTrace])
+    }
+
+    private func isDiscoverAuthFailure(_ result: ApiCallResult) -> Bool {
+        if result.httpStatus == 401 || result.httpStatus == 403 {
+            return true
+        }
+        if !result.ok && result.businessCode == 401 {
+            return true
+        }
+        let rawText = result.message ?? result.bodyText
+        if !result.ok && matchesAnyKeyword(rawText, keywords: profile.result.authKeywords) {
+            return true
+        }
+        return false
+    }
+
+    private func makeDiscoverTrace(for result: ApiCallResult, account: Account) -> AttemptTrace {
+        let path = profile.endpoint("activeLesson")?.path ?? "/api/v3/classroom/on-lesson-upcoming-exam"
+        let requestUrl = result.requestUrl.isEmpty ? "\(account.scheme)://\(account.host)\(path)" : result.requestUrl
+        return AttemptTrace(
+            strategyId: "DISCOVER_ACTIVE_LESSON",
+            method: "GET",
+            url: requestUrl,
+            httpStatus: result.httpStatus,
+            businessCode: result.businessCode,
+            message: result.message ?? String(result.bodyText.prefix(160)),
+            elapsedMs: result.elapsedMs
+        )
     }
 
     private func discoverActiveLesson(
@@ -469,43 +512,55 @@ final class CheckInOrchestrator: Sendable {
         credentialsRefreshed: inout Bool,
         ticket: QrTicket
     ) async -> DiscoverOutcome {
-        let active = await client.callEndpoint("activeLesson", account: account, variables: [:])
-        applyAuthUpdateIfChanged(
-            auth: active.authUpdate,
-            markOk: active.ok,
-            account: &account,
-            credentialsRefreshed: &credentialsRefreshed
-        )
+        let initialActive = await client.callEndpoint("activeLesson", account: account, variables: [:])
+        var recorded: [AttemptTrace] = [makeDiscoverTrace(for: initialActive, account: account)]
+        var active = initialActive
 
-        let path = profile.endpoint("activeLesson")?.path ?? "/api/v3/classroom/on-lesson-upcoming-exam"
-        let requestUrl = active.requestUrl.isEmpty ? "\(account.scheme)://\(account.host)\(path)" : active.requestUrl
-        let trace = AttemptTrace(
-            strategyId: "DISCOVER_ACTIVE_LESSON",
-            method: "GET",
-            url: requestUrl,
-            httpStatus: active.httpStatus,
-            businessCode: active.businessCode,
-            message: active.message ?? String(active.bodyText.prefix(160)),
-            elapsedMs: active.elapsedMs
-        )
+        let hasBearer = !(account.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasSession = !(account.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        if !initialActive.ok && hasBearer && hasSession && isDiscoverAuthFailure(initialActive) && !Task.isCancelled {
+            var cookieOnlyAccount = account
+            cookieOnlyAccount.bearer = nil
+            let retryActive = await client.callEndpoint("activeLesson", account: cookieOnlyAccount, variables: [:])
+            recorded.append(makeDiscoverTrace(for: retryActive, account: cookieOnlyAccount))
+            active = retryActive
+            if retryActive.ok {
+                account = cookieOnlyAccount
+                credentialsRefreshed = true
+                applyAuthUpdateIfChanged(
+                    auth: retryActive.authUpdate,
+                    markOk: true,
+                    account: &account,
+                    credentialsRefreshed: &credentialsRefreshed
+                )
+            }
+        } else {
+            applyAuthUpdateIfChanged(
+                auth: initialActive.authUpdate,
+                markOk: initialActive.ok,
+                account: &account,
+                credentialsRefreshed: &credentialsRefreshed
+            )
+        }
 
         if active.httpStatus == -1 {
-            return .networkError("查询进行中课堂网络异常: \(String(active.bodyText.prefix(120)))", trace)
+            return .networkError("查询进行中课堂网络异常: \(String(active.bodyText.prefix(120)))", recorded)
         }
         if active.httpStatus == 401 || active.httpStatus == 403 {
             return .authExpired(
                 active.message ?? "查询课堂时鉴权失败 (HTTP \(active.httpStatus))",
-                trace
+                recorded
             )
         }
         let rawText = active.message ?? active.bodyText
-        if !active.ok && matchesAnyKeyword(rawText, keywords: profile.result.authKeywords) {
-            return .authExpired(active.message ?? "查询课堂时会话失效", trace)
+        if !active.ok && (active.businessCode == 401 || matchesAnyKeyword(rawText, keywords: profile.result.authKeywords)) {
+            return .authExpired(active.message ?? "查询课堂时会话失效", recorded)
         }
         if !active.ok && (active.httpStatus >= 500 || profile.result.retryHttpStatus.contains(active.httpStatus)) {
             return .networkError(
                 active.message ?? "查询进行中课堂服务端异常 (HTTP \(active.httpStatus))",
-                trace
+                recorded
             )
         }
 
@@ -518,11 +573,11 @@ final class CheckInOrchestrator: Sendable {
                 matched = lessons.first
             }
             if let matched {
-                return .found(matched, trace)
+                return .found(matched, recorded)
             }
         }
 
-        return .notFound("无法确定 lessonId，请确认二维码属于进行中的课堂", trace)
+        return .notFound("无法确定 lessonId，请确认二维码属于进行中的课堂", recorded)
     }
 
     private enum PlanBuildResult {
@@ -610,6 +665,35 @@ final class CheckInOrchestrator: Sendable {
         }
     }
 
+    private func performPlan(
+        _ plan: PlanBuildResult,
+        account: Account,
+        variables: [String: TemplateValue],
+        referer: String
+    ) async -> ApiCallResult? {
+        switch plan {
+        case .endpointPlan(let endpointKey, _, _):
+            return await client.executeEndpoint(
+                endpointKey,
+                account: account,
+                variables: variables,
+                extraCookies: [:],
+                referer: referer,
+                extraHeaders: [:]
+            )
+        case .directUrlPlan(let method, let url, let body):
+            return await client.callDirectUrl(
+                url,
+                method: method,
+                account: account,
+                body: body,
+                referer: referer
+            )
+        case .rejected:
+            return nil
+        }
+    }
+
     private func executeStrategy(
         spec: StrategySpec,
         variables: [String: TemplateValue],
@@ -635,6 +719,7 @@ final class CheckInOrchestrator: Sendable {
         var recorded: [AttemptTrace] = []
         var finalState: SignState = .failed
         var attemptIndex = 0
+        var triedCookieOnlyFallback = false
 
         while attemptIndex < maxAttemptsPerStrategy {
             if Task.isCancelled {
@@ -649,62 +734,106 @@ final class CheckInOrchestrator: Sendable {
                 referer = "\(base)/v2/web/index"
             }
 
-            let apiResult: ApiCallResult
-            switch plan {
-            case .endpointPlan(let endpointKey, _, _):
-                apiResult = await client.executeEndpoint(
-                    endpointKey,
-                    account: account,
-                    variables: variables,
-                    extraCookies: [:],
-                    referer: referer,
-                    extraHeaders: [:]
-                )
-            case .directUrlPlan(let method, let url, let body):
-                apiResult = await client.callDirectUrl(
-                    url,
-                    method: method,
-                    account: account,
-                    body: body,
-                    referer: referer
-                )
-            case .rejected:
+            guard let initialApiResult = await performPlan(
+                plan,
+                account: account,
+                variables: variables,
+                referer: referer
+            ) else {
                 return (recorded, .failed)
             }
 
-            let state = classify(
-                httpStatus: apiResult.httpStatus,
-                businessCode: apiResult.businessCode,
-                message: apiResult.message,
-                bodyText: apiResult.bodyText
+            let initialState = classify(
+                httpStatus: initialApiResult.httpStatus,
+                businessCode: initialApiResult.businessCode,
+                message: initialApiResult.message,
+                bodyText: initialApiResult.bodyText
             )
-            finalState = state
-            let isOk = (state == .success || state == .already)
+            let initialIsOk = (initialState == .success || initialState == .already)
 
-            let trace = AttemptTrace(
+            let initialTrace = AttemptTrace(
                 strategyId: spec.id,
-                method: apiResult.requestMethod,
-                url: apiResult.requestUrl,
-                httpStatus: apiResult.httpStatus,
-                businessCode: apiResult.businessCode,
-                message: apiResult.message ?? String(apiResult.bodyText.prefix(160)),
-                elapsedMs: apiResult.elapsedMs
+                method: initialApiResult.requestMethod,
+                url: initialApiResult.requestUrl,
+                httpStatus: initialApiResult.httpStatus,
+                businessCode: initialApiResult.businessCode,
+                message: initialApiResult.message ?? String(initialApiResult.bodyText.prefix(160)),
+                elapsedMs: initialApiResult.elapsedMs
             )
-            recorded.append(trace)
+            recorded.append(initialTrace)
 
-            // 响应携带新凭据时立即回填，后续重试与策略立刻生效
-            applyAuthUpdateIfChanged(
-                auth: apiResult.authUpdate,
-                markOk: isOk,
-                account: &account,
-                credentialsRefreshed: &credentialsRefreshed
-            )
+            var effectiveResult = initialApiResult
+            var effectiveState = initialState
+            var effectiveIsOk = initialIsOk
 
-            let retryableStatus = apiResult.httpStatus == -1
-                || profile.result.retryHttpStatus.contains(apiResult.httpStatus)
-            let abortImmediately = (state == .qrExpired || state == .authExpired)
+            let hasBearer = !(account.bearer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let hasSession = !(account.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-            if isOk || abortImmediately || !retryableStatus || attemptIndex >= maxAttemptsPerStrategy - 1 || Task.isCancelled {
+            if initialState == .authExpired && hasBearer && hasSession && !triedCookieOnlyFallback && !Task.isCancelled {
+                triedCookieOnlyFallback = true
+                var cookieOnlyAccount = account
+                cookieOnlyAccount.bearer = nil
+
+                if let retryApiResult = await performPlan(
+                    plan,
+                    account: cookieOnlyAccount,
+                    variables: variables,
+                    referer: referer
+                ) {
+                    let retryState = classify(
+                        httpStatus: retryApiResult.httpStatus,
+                        businessCode: retryApiResult.businessCode,
+                        message: retryApiResult.message,
+                        bodyText: retryApiResult.bodyText
+                    )
+                    let retryIsOk = (retryState == .success || retryState == .already)
+                    let retryTrace = AttemptTrace(
+                        strategyId: spec.id,
+                        method: retryApiResult.requestMethod,
+                        url: retryApiResult.requestUrl,
+                        httpStatus: retryApiResult.httpStatus,
+                        businessCode: retryApiResult.businessCode,
+                        message: retryApiResult.message ?? String(retryApiResult.bodyText.prefix(160)),
+                        elapsedMs: retryApiResult.elapsedMs
+                    )
+                    recorded.append(retryTrace)
+
+                    effectiveResult = retryApiResult
+                    effectiveState = retryState
+                    effectiveIsOk = retryIsOk
+
+                    let cookieAuthAccepted = retryIsOk
+                        || ((200...299).contains(retryApiResult.httpStatus)
+                            && retryState != .authExpired
+                            && retryState != .networkError)
+                    if cookieAuthAccepted {
+                        account = cookieOnlyAccount
+                        credentialsRefreshed = true
+                        applyAuthUpdateIfChanged(
+                            auth: retryApiResult.authUpdate,
+                            markOk: retryIsOk,
+                            account: &account,
+                            credentialsRefreshed: &credentialsRefreshed
+                        )
+                    }
+                }
+            } else {
+                // 响应携带新凭据时立即回填，后续重试与策略立刻生效
+                applyAuthUpdateIfChanged(
+                    auth: initialApiResult.authUpdate,
+                    markOk: initialIsOk,
+                    account: &account,
+                    credentialsRefreshed: &credentialsRefreshed
+                )
+            }
+
+            finalState = effectiveState
+
+            let retryableStatus = effectiveResult.httpStatus == -1
+                || profile.result.retryHttpStatus.contains(effectiveResult.httpStatus)
+            let abortImmediately = (effectiveState == .qrExpired || effectiveState == .authExpired)
+
+            if effectiveIsOk || abortImmediately || !retryableStatus || attemptIndex >= maxAttemptsPerStrategy - 1 || Task.isCancelled {
                 break
             }
 

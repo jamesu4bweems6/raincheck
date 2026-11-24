@@ -103,7 +103,7 @@ data class ResultSpec(
     val messageFields: List<String> = listOf("msg", "message"),
     val altMessageKeys: List<String> = listOf("errmsg"),
     val alreadyKeywords: List<String> = listOf("已签到", "已经签到", "重复签到", "已参与"),
-    val authKeywords: List<String> = listOf("登录", "未授权", "身份", "token", "会话", "unauthorized"),
+    val authKeywords: List<String> = listOf("登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"),
     val expiredKeywords: List<String> = listOf("失效", "过期", "不存在", "二维码已"),
     val retryHttpStatus: List<Int> = listOf(408, 425, 429, 500, 502, 503, 504),
 ) {

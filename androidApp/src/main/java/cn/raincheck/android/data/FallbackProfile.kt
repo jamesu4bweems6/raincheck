@@ -14,7 +14,7 @@ import kotlinx.serialization.json.put
 /**
  * `assets/protocol_profile.json` 读取或解析异常时的内置完整兜底配置。
  *
- * 与仓库 `protocol/profile.json` 保持 100% 字段与端点一致（含 7 站点、17 端点、6 策略、
+ * 与仓库 `protocol/profile.json` 保持 100% 字段与端点一致（含 7 站点、19 端点、6 策略、
  * `qr` 白名单及 `result` 双字段兼容规则），保证即使资源损坏也绝不退化安全边界。
  */
 internal object FallbackProfile {
@@ -94,6 +94,30 @@ internal object FallbackProfile {
                 body = body("token" to "{loginToken}", "code" to "{code}"),
                 auth = false,
                 note = "外部桌面端脚本推断，未经实网抓包验证",
+            ),
+            "phoneSendSms" to EndpointSpec(
+                method = "POST",
+                path = "/pc/login/send_sms_login_code/",
+                body = body(
+                    "mobile" to "{mobile}",
+                    "login" to true,
+                    "ticket" to "{ticket}",
+                    "randstr" to "{randstr}",
+                    "hcaptcha_token" to "{hcaptchaToken}",
+                ),
+                auth = false,
+                note = "雨课堂 Web PC 端发送短信验证码接口（保留末尾斜杠；IPA 1.3.6 移动端对应 /api/v3/user/code/send）",
+            ),
+            "phoneVerifyLogin" to EndpointSpec(
+                method = "POST",
+                path = "/pc/login/verify_pwd_login/",
+                body = body(
+                    "type" to "PC",
+                    "name" to "{mobile}",
+                    "pwd" to "{code}",
+                ),
+                auth = false,
+                note = "雨课堂 Web PC 端手机号+短信验证码登录接口（保留末尾斜杠，Set-Cookie 下发 sessionid/csrftoken；IPA 1.3.6 移动端对应 /api/v3/user/login/app）",
             ),
             "activeLesson" to EndpointSpec(
                 method = "GET",

@@ -21,7 +21,7 @@ enum LiquidPalette {
     static func elevatedSurface(_ scheme: ColorScheme) -> Color {
         switch scheme {
         case .dark:
-            return Color(white: 0.115)
+            return Color(white: 0.125)
         default:
             return Color(white: 1.0)
         }
@@ -43,6 +43,36 @@ enum LiquidPalette {
         default:
             return Color.black.opacity(0.08)
         }
+    }
+
+    static func selectedPillSurface(_ scheme: ColorScheme) -> Color {
+        switch scheme {
+        case .dark:
+            return Color(white: 0.22)
+        default:
+            return Color(white: 1.0)
+        }
+    }
+
+    static func selectedPillBorder(_ scheme: ColorScheme) -> Color {
+        switch scheme {
+        case .dark:
+            return Color.white.opacity(0.22)
+        default:
+            return Color.black.opacity(0.09)
+        }
+    }
+
+    static func darkChromeTrackSurface() -> Color {
+        Color.black.opacity(0.56)
+    }
+
+    static func darkChromeSelectedPillSurface() -> Color {
+        Color.white.opacity(0.95)
+    }
+
+    static func darkChromeSelectedForeground() -> Color {
+        Color(white: 0.08)
     }
 
     static func editionDisplayName(forHost host: String) -> String {
@@ -105,13 +135,26 @@ enum LiquidPalette {
     }
 }
 
-/// Consistent spatial tokens for minimalist pages and glass surfaces.
+/// Consistent spatial tokens for minimalist pages, widened buttons, and glass surfaces.
 enum LiquidMetrics {
     static let cornerRadiusCard: CGFloat = 24
     static let cornerRadiusControl: CGFloat = 14
     static let pageHorizontalPadding: CGFloat = 20
     static let sectionSpacing: CGFloat = 20
     static let cardPadding: CGFloat = 18
+
+    // Widened button & touch-target tokens (comfortable proportions, safe on 375pt iPhones)
+    static let buttonHorizontalPadding: CGFloat = 24
+    static let buttonCompactHorizontalPadding: CGFloat = 18
+    static let buttonVerticalPadding: CGFloat = 12
+    static let buttonMinWidth: CGFloat = 112
+    static let buttonMinHeight: CGFloat = 46
+
+    // Segmented / floating dock control metrics & bottom scroll breathing room
+    static let dockControlMinHeight: CGFloat = 40
+    static let dockItemMinWidth: CGFloat = 48
+    static let dockItemMinHeight: CGFloat = 34
+    static let scrollBottomPadding: CGFloat = 28
 }
 
 /// Single-tone neutral backdrop canvas for every screen.
@@ -174,7 +217,9 @@ private struct LiquidGlassCardModifier: ViewModifier {
         content
             .background(.regularMaterial, in: shape)
             .overlay {
-                shape.strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                shape
+                    .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                    .allowsHitTesting(false)
             }
             .shadow(
                 color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.05),
@@ -210,7 +255,9 @@ private struct LiquidGlassCapsuleModifier: ViewModifier {
         content
             .background(.ultraThinMaterial, in: Capsule())
             .overlay {
-                Capsule().strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                Capsule()
+                    .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                    .allowsHitTesting(false)
             }
             .shadow(
                 color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.04),
@@ -221,22 +268,148 @@ private struct LiquidGlassCapsuleModifier: ViewModifier {
     }
 }
 
-private struct LiquidFallbackPrimaryButtonStyle: ButtonStyle {
+#if compiler(>=6.2)
+@available(iOS 26.0, *)
+private struct LiquidGlassPrimaryButtonStyle: ButtonStyle {
+    let minWidth: CGFloat?
+    let horizontalPadding: CGFloat
+    let fullWidth: Bool
+
     func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration)
+        BodyView(
+            configuration: configuration,
+            minWidth: minWidth,
+            horizontalPadding: horizontalPadding,
+            fullWidth: fullWidth
+        )
     }
 
     private struct BodyView: View {
         @Environment(\.isEnabled) private var isEnabled
         let configuration: Configuration
+        let minWidth: CGFloat?
+        let horizontalPadding: CGFloat
+        let fullWidth: Bool
 
         var body: some View {
             configuration.label
                 .font(.body.weight(.semibold))
                 .foregroundStyle(Color.white)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 11)
+                .tint(Color.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.84)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.vertical, LiquidMetrics.buttonVerticalPadding)
+                .frame(
+                    minWidth: minWidth,
+                    maxWidth: fullWidth ? CGFloat.infinity : nil,
+                    minHeight: LiquidMetrics.buttonMinHeight
+                )
+                .contentShape(Capsule())
+                .glassEffect(
+                    .regular.tint(LiquidPalette.accent).interactive(isEnabled),
+                    in: Capsule()
+                )
+                .opacity(isEnabled ? 1.0 : 0.45)
+        }
+    }
+}
+
+@available(iOS 26.0, *)
+private struct LiquidGlassSecondaryButtonStyle: ButtonStyle {
+    let minWidth: CGFloat?
+    let horizontalPadding: CGFloat
+    let fullWidth: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        BodyView(
+            configuration: configuration,
+            minWidth: minWidth,
+            horizontalPadding: horizontalPadding,
+            fullWidth: fullWidth
+        )
+    }
+
+    private struct BodyView: View {
+        @Environment(\.isEnabled) private var isEnabled
+        let configuration: Configuration
+        let minWidth: CGFloat?
+        let horizontalPadding: CGFloat
+        let fullWidth: Bool
+
+        var body: some View {
+            configuration.label
+                .font(.body.weight(.medium))
+                .foregroundStyle(LiquidPalette.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.84)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.vertical, LiquidMetrics.buttonVerticalPadding)
+                .frame(
+                    minWidth: minWidth,
+                    maxWidth: fullWidth ? CGFloat.infinity : nil,
+                    minHeight: LiquidMetrics.buttonMinHeight
+                )
+                .contentShape(Capsule())
+                .glassEffect(
+                    .regular.interactive(isEnabled),
+                    in: Capsule()
+                )
+                .opacity(isEnabled ? 1.0 : 0.45)
+        }
+    }
+}
+#endif
+
+private struct LiquidFallbackPrimaryButtonStyle: ButtonStyle {
+    let minWidth: CGFloat?
+    let horizontalPadding: CGFloat
+    let fullWidth: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        BodyView(
+            configuration: configuration,
+            minWidth: minWidth,
+            horizontalPadding: horizontalPadding,
+            fullWidth: fullWidth
+        )
+    }
+
+    private struct BodyView: View {
+        @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.colorScheme) private var colorScheme
+        let configuration: Configuration
+        let minWidth: CGFloat?
+        let horizontalPadding: CGFloat
+        let fullWidth: Bool
+
+        var body: some View {
+            configuration.label
+                .font(.body.weight(.semibold))
+                .foregroundStyle(Color.white)
+                .tint(Color.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.84)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.vertical, LiquidMetrics.buttonVerticalPadding)
+                .frame(
+                    minWidth: minWidth,
+                    maxWidth: fullWidth ? CGFloat.infinity : nil,
+                    minHeight: LiquidMetrics.buttonMinHeight
+                )
                 .background(LiquidPalette.accent, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
+                .shadow(
+                    color: LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.16),
+                    radius: 10,
+                    x: 0,
+                    y: 4
+                )
+                .contentShape(Capsule())
                 .opacity(configuration.isPressed ? 0.84 : (isEnabled ? 1.0 : 0.45))
                 .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
                 .animation(.easeOut(duration: 0.16), value: configuration.isPressed)
@@ -245,25 +418,53 @@ private struct LiquidFallbackPrimaryButtonStyle: ButtonStyle {
 }
 
 private struct LiquidFallbackSecondaryButtonStyle: ButtonStyle {
+    let minWidth: CGFloat?
+    let horizontalPadding: CGFloat
+    let fullWidth: Bool
+
     func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration)
+        BodyView(
+            configuration: configuration,
+            minWidth: minWidth,
+            horizontalPadding: horizontalPadding,
+            fullWidth: fullWidth
+        )
     }
 
     private struct BodyView: View {
         @Environment(\.isEnabled) private var isEnabled
         @Environment(\.colorScheme) private var colorScheme
         let configuration: Configuration
+        let minWidth: CGFloat?
+        let horizontalPadding: CGFloat
+        let fullWidth: Bool
 
         var body: some View {
             configuration.label
                 .font(.body.weight(.medium))
                 .foregroundStyle(LiquidPalette.primaryText)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 11)
-                .background(.ultraThinMaterial, in: Capsule())
+                .lineLimit(1)
+                .minimumScaleFactor(0.84)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.vertical, LiquidMetrics.buttonVerticalPadding)
+                .frame(
+                    minWidth: minWidth,
+                    maxWidth: fullWidth ? CGFloat.infinity : nil,
+                    minHeight: LiquidMetrics.buttonMinHeight
+                )
+                .background(.regularMaterial, in: Capsule())
                 .overlay {
-                    Capsule().strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                    Capsule()
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
                 }
+                .shadow(
+                    color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.05),
+                    radius: 8,
+                    x: 0,
+                    y: 3
+                )
+                .contentShape(Capsule())
                 .opacity(configuration.isPressed ? 0.76 : (isEnabled ? 1.0 : 0.45))
                 .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
                 .animation(.easeOut(duration: 0.16), value: configuration.isPressed)
@@ -294,30 +495,72 @@ extension View {
     }
 
     @ViewBuilder
-    func liquidPrimaryButtonStyle() -> some View {
+    func liquidPrimaryButtonStyle(
+        minWidth: CGFloat? = LiquidMetrics.buttonMinWidth,
+        horizontalPadding: CGFloat = LiquidMetrics.buttonHorizontalPadding,
+        fullWidth: Bool = false
+    ) -> some View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            self
-                .buttonStyle(.glassProminent)
-                .tint(LiquidPalette.accent)
+            self.buttonStyle(
+                LiquidGlassPrimaryButtonStyle(
+                    minWidth: minWidth,
+                    horizontalPadding: horizontalPadding,
+                    fullWidth: fullWidth
+                )
+            )
         } else {
-            self.buttonStyle(LiquidFallbackPrimaryButtonStyle())
+            self.buttonStyle(
+                LiquidFallbackPrimaryButtonStyle(
+                    minWidth: minWidth,
+                    horizontalPadding: horizontalPadding,
+                    fullWidth: fullWidth
+                )
+            )
         }
         #else
-        self.buttonStyle(LiquidFallbackPrimaryButtonStyle())
+        self.buttonStyle(
+            LiquidFallbackPrimaryButtonStyle(
+                minWidth: minWidth,
+                horizontalPadding: horizontalPadding,
+                fullWidth: fullWidth
+            )
+        )
         #endif
     }
 
     @ViewBuilder
-    func liquidSecondaryButtonStyle() -> some View {
+    func liquidSecondaryButtonStyle(
+        minWidth: CGFloat? = LiquidMetrics.buttonMinWidth,
+        horizontalPadding: CGFloat = LiquidMetrics.buttonHorizontalPadding,
+        fullWidth: Bool = false
+    ) -> some View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            self.buttonStyle(.glass)
+            self.buttonStyle(
+                LiquidGlassSecondaryButtonStyle(
+                    minWidth: minWidth,
+                    horizontalPadding: horizontalPadding,
+                    fullWidth: fullWidth
+                )
+            )
         } else {
-            self.buttonStyle(LiquidFallbackSecondaryButtonStyle())
+            self.buttonStyle(
+                LiquidFallbackSecondaryButtonStyle(
+                    minWidth: minWidth,
+                    horizontalPadding: horizontalPadding,
+                    fullWidth: fullWidth
+                )
+            )
         }
         #else
-        self.buttonStyle(LiquidFallbackSecondaryButtonStyle())
+        self.buttonStyle(
+            LiquidFallbackSecondaryButtonStyle(
+                minWidth: minWidth,
+                horizontalPadding: horizontalPadding,
+                fullWidth: fullWidth
+            )
+        )
         #endif
     }
 

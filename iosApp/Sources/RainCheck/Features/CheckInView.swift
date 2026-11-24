@@ -51,7 +51,8 @@ struct CheckInView: View {
                         actionFooter
                     }
                     .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
-                    .padding(.vertical, 16)
+                    .padding(.top, 14)
+                    .padding(.bottom, LiquidMetrics.scrollBottomPadding)
                 }
             }
             .navigationTitle("签到")
@@ -117,24 +118,71 @@ struct CheckInView: View {
         HStack(spacing: 10) {
             LiquidStatusChip(symbol: "testtube.2", text: "演练模式 · 不发送网络请求", emphasized: true)
             Spacer(minLength: 8)
-            Button("关闭") {
+            Button {
                 store.dryRun = false
+            } label: {
+                Text("关闭")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .lineLimit(1)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .frame(minWidth: 68, minHeight: 32)
+                    .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                            .allowsHitTesting(false)
+                    }
+                    .contentShape(Capsule())
             }
-            .font(.footnote.weight(.medium))
-            .foregroundStyle(LiquidPalette.secondaryText)
+            .buttonStyle(.plain)
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            LiquidPalette.elevatedSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl + 4, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl + 4, style: .continuous)
+                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                .allowsHitTesting(false)
         }
     }
 
     private var scanHeroCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("扫描课堂二维码")
-                    .font(.headline)
-                    .foregroundStyle(LiquidPalette.primaryText)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "qrcode.viewfinder")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(LiquidPalette.accent)
+                    .frame(width: 42, height: 42)
+                    .background(
+                        LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(
+                                LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                lineWidth: 0.75
+                            )
+                            .allowsHitTesting(false)
+                    }
 
-                Text("支持动态签到码与课堂链接，识别后由你确认再执行。")
-                    .font(.subheadline)
-                    .foregroundStyle(LiquidPalette.secondaryText)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("扫描课堂二维码")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(LiquidPalette.primaryText)
+
+                    Text("支持动态签到码与课堂链接，识别后由你确认再执行。")
+                        .font(.subheadline)
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             LiquidGlassGroup(spacing: 12) {
@@ -143,17 +191,23 @@ struct CheckInView: View {
                         showScanner = true
                     } label: {
                         Label("扫描二维码", systemImage: "qrcode.viewfinder")
-                            .frame(maxWidth: .infinity)
                     }
-                    .liquidPrimaryButtonStyle()
+                    .liquidPrimaryButtonStyle(
+                        minWidth: nil,
+                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
+                        fullWidth: true
+                    )
 
                     Button {
                         handlePasteAction()
                     } label: {
                         Label("粘贴链接", systemImage: "doc.on.clipboard")
-                            .frame(maxWidth: .infinity)
                     }
-                    .liquidSecondaryButtonStyle()
+                    .liquidSecondaryButtonStyle(
+                        minWidth: nil,
+                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
+                        fullWidth: true
+                    )
                 }
             }
         }
@@ -163,7 +217,7 @@ struct CheckInView: View {
 
     private func ticketSummaryCard(_ ticket: QrTicket) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
                 LiquidStatusChip(
                     symbol: ticketSymbol(for: ticket.kind),
                     text: ticket.kind.displayTitle,
@@ -182,14 +236,23 @@ struct CheckInView: View {
                     Image(systemName: "xmark")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(LiquidPalette.secondaryText)
-                        .frame(width: 28, height: 28)
+                        .frame(width: 32, height: 32)
                         .background(LiquidPalette.subtleSurface(colorScheme), in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                                .allowsHitTesting(false)
+                        }
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("清除当前二维码")
             }
 
-            VStack(alignment: .leading, spacing: 6) {
+            Divider()
+                .overlay(LiquidPalette.hairline(colorScheme))
+
+            VStack(alignment: .leading, spacing: 8) {
                 if let host = ticket.host, !host.isEmpty {
                     ticketMetaRow(
                         label: "平台",
@@ -230,6 +293,11 @@ struct CheckInView: View {
                     LiquidPalette.subtleSurface(colorScheme),
                     in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
             }
 
             if !store.isCurrentTicketHostTrusted() {
@@ -251,6 +319,11 @@ struct CheckInView: View {
                     LiquidPalette.subtleSurface(colorScheme),
                     in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
             }
         }
         .padding(LiquidMetrics.cardPadding)
@@ -260,9 +333,9 @@ struct CheckInView: View {
     private func ticketMetaRow(label: String, value: String, monospaced: Bool = false) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(label)
-                .font(.caption)
+                .font(.caption.weight(.medium))
                 .foregroundStyle(LiquidPalette.tertiaryText)
-                .frame(width: 48, alignment: .leading)
+                .frame(width: 52, alignment: .leading)
 
             Text(value)
                 .font(monospaced ? .system(.subheadline, design: .monospaced) : .subheadline)
@@ -280,52 +353,86 @@ struct CheckInView: View {
             let labelText = remaining > 0 ? "约剩 \(remaining)s" : "已生成 \(elapsed)s"
 
             Text(labelText)
-                .font(.system(.caption, design: .monospaced).weight(.medium))
+                .font(.system(.caption, design: .monospaced).weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(remaining > 0 ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
                 .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
         }
     }
 
     private var accountSelectionSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
+            HStack(alignment: .center, spacing: 10) {
                 LiquidSectionHeader(
                     title: "参与账号",
                     trailing: "已选 \(selectedEnabledCount) / \(enabledAccounts.count)"
                 )
 
                 if !enabledAccounts.isEmpty {
-                    Button(allEnabledSelected ? "取消全选" : "全选") {
+                    Button {
                         store.toggleSelectAllEnabled()
+                    } label: {
+                        Text(allEnabledSelected ? "取消全选" : "全选")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(LiquidPalette.accent)
+                            .lineLimit(1)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .frame(minWidth: 72, minHeight: 30)
+                            .background(
+                                LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                                in: Capsule()
+                            )
+                            .overlay {
+                                Capsule()
+                                    .strokeBorder(
+                                        LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                        lineWidth: 0.75
+                                    )
+                                    .allowsHitTesting(false)
+                            }
+                            .contentShape(Capsule())
                     }
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(LiquidPalette.accent)
+                    .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
                 }
             }
 
             if enabledAccounts.isEmpty {
-                VStack(spacing: 6) {
-                    Text("暂无已启用账号")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(LiquidPalette.primaryText)
-                    Text("请前往「账号」页面添加或启用账号。")
-                        .font(.footnote)
+                VStack(spacing: 10) {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .font(.title3)
                         .foregroundStyle(LiquidPalette.secondaryText)
+
+                    VStack(spacing: 4) {
+                        Text("暂无已启用账号")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(LiquidPalette.primaryText)
+                        Text("请前往「账号」页面添加或启用账号。")
+                            .font(.footnote)
+                            .foregroundStyle(LiquidPalette.secondaryText)
+                    }
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
+                .padding(.vertical, 26)
                 .padding(.horizontal, LiquidMetrics.cardPadding)
                 .background(
                     LiquidPalette.elevatedSurface(colorScheme),
                     in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
                 )
-                .overlay(
+                .overlay {
                     RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
                         .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-                )
+                        .allowsHitTesting(false)
+                }
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(enabledAccounts.enumerated()), id: \.element.id) { index, account in
@@ -338,9 +445,9 @@ struct CheckInView: View {
                                     .font(.title3)
                                     .foregroundStyle(isSelected ? LiquidPalette.accent : LiquidPalette.secondaryText)
 
-                                VStack(alignment: .leading, spacing: 2) {
+                                VStack(alignment: .leading, spacing: 3) {
                                     Text(account.label)
-                                        .font(.subheadline.weight(.medium))
+                                        .font(.subheadline.weight(.semibold))
                                         .foregroundStyle(LiquidPalette.primaryText)
                                         .lineLimit(1)
 
@@ -354,12 +461,20 @@ struct CheckInView: View {
 
                                 if !account.hasCredential {
                                     Text("缺少凭据")
-                                        .font(.caption2)
-                                        .foregroundStyle(LiquidPalette.tertiaryText)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(LiquidPalette.secondaryText)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
                                 }
                             }
                             .padding(.horizontal, 16)
-                            .padding(.vertical, 13)
+                            .padding(.vertical, 14)
+                            .background(
+                                isSelected
+                                    ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.08 : 0.045)
+                                    : Color.clear
+                            )
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -371,55 +486,96 @@ struct CheckInView: View {
                         }
                     }
                 }
+                .clipShape(RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous))
                 .background(
                     LiquidPalette.elevatedSurface(colorScheme),
                     in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
                 )
-                .overlay(
+                .overlay {
                     RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
                         .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-                )
+                        .allowsHitTesting(false)
+                }
             }
         }
+    }
+
+    private var actionFooterHint: String? {
+        guard !canStartCheckIn else { return nil }
+        guard let ticket = store.currentTicket else {
+            return "请先扫描或粘贴签到二维码"
+        }
+        if ticket.kind == .login {
+            return "当前为登录二维码，请前往「账号」页添加账号"
+        }
+        if selectedEnabledCount == 0 {
+            return "请至少选择一个已启用账号"
+        }
+        return nil
     }
 
     @ViewBuilder
     private var actionFooter: some View {
         if store.isCheckingIn {
-            HStack(spacing: 14) {
-                ProgressView()
-                    .tint(LiquidPalette.accent)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 14) {
+                    ProgressView()
+                        .tint(LiquidPalette.accent)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(store.dryRun ? "正在执行模拟演练" : "正在签到")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(LiquidPalette.primaryText)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(store.dryRun ? "正在执行模拟演练" : "正在签到")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(LiquidPalette.primaryText)
 
-                    Text("进度 \(store.checkInCompletedCount) / \(max(store.checkInTotalCount, 1))")
-                        .font(.system(.caption, design: .monospaced))
-                        .monospacedDigit()
-                        .foregroundStyle(LiquidPalette.secondaryText)
+                        Text("进度 \(store.checkInCompletedCount) / \(max(store.checkInTotalCount, 1))")
+                            .font(.system(.caption, design: .monospaced))
+                            .monospacedDigit()
+                            .foregroundStyle(LiquidPalette.secondaryText)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button("取消") {
+                        store.cancelCheckIn()
+                    }
+                    .liquidSecondaryButtonStyle(
+                        minWidth: 96,
+                        horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding
+                    )
                 }
 
-                Spacer(minLength: 8)
-
-                Button("取消") {
-                    store.cancelCheckIn()
-                }
-                .liquidSecondaryButtonStyle()
+                ProgressView(
+                    value: Double(max(0, min(store.checkInCompletedCount, max(store.checkInTotalCount, 1)))),
+                    total: Double(max(store.checkInTotalCount, 1))
+                )
+                .tint(LiquidPalette.accent)
             }
             .padding(LiquidMetrics.cardPadding)
             .liquidGlassCard()
         } else {
-            Button {
-                store.startCheckIn()
-            } label: {
-                Text(store.dryRun ? "模拟演练" : "开始签到")
-                    .font(.body.weight(.semibold))
-                    .frame(maxWidth: .infinity)
+            VStack(spacing: 10) {
+                Button {
+                    store.startCheckIn()
+                } label: {
+                    Label(
+                        store.dryRun ? "开始模拟演练" : "开始签到",
+                        systemImage: store.dryRun ? "testtube.2" : "checkmark.circle.fill"
+                    )
+                }
+                .liquidPrimaryButtonStyle(
+                    minWidth: nil,
+                    horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                    fullWidth: true
+                )
+                .disabled(!canStartCheckIn)
+
+                if let hint = actionFooterHint {
+                    Text(hint)
+                        .font(.footnote)
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .multilineTextAlignment(.center)
+                }
             }
-            .liquidPrimaryButtonStyle()
-            .disabled(!canStartCheckIn)
         }
     }
 
@@ -461,13 +617,14 @@ private struct ManualLinkInputSheet: View {
             ZStack {
                 LiquidCanvas()
 
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 18) {
                     Text("剪贴板为空时，可在此直接输入或粘贴雨课堂签到链接。")
                         .font(.subheadline)
                         .foregroundStyle(LiquidPalette.secondaryText)
 
                     TextField("粘贴或输入二维码内容", text: $text, axis: .vertical)
                         .lineLimit(3...6)
+                        .font(.system(.subheadline, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .padding(14)
@@ -475,15 +632,49 @@ private struct ManualLinkInputSheet: View {
                             LiquidPalette.elevatedSurface(colorScheme),
                             in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                         )
-                        .overlay(
+                        .overlay {
                             RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
                                 .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
-                        )
+                                .allowsHitTesting(false)
+                        }
+
+                    LiquidGlassGroup(spacing: 12) {
+                        VStack(spacing: 12) {
+                            Button {
+                                onConfirm(trimmed)
+                                dismiss()
+                            } label: {
+                                Label("识别链接", systemImage: "qrcode.viewfinder")
+                            }
+                            .liquidPrimaryButtonStyle(
+                                minWidth: nil,
+                                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                                fullWidth: true
+                            )
+                            .disabled(trimmed.isEmpty)
+
+                            #if canImport(UIKit)
+                            Button {
+                                if let pasted = UIPasteboard.general.string {
+                                    text = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+                                }
+                            } label: {
+                                Label("从剪贴板粘贴", systemImage: "doc.on.clipboard")
+                            }
+                            .liquidSecondaryButtonStyle(
+                                minWidth: nil,
+                                horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                                fullWidth: true
+                            )
+                            #endif
+                        }
+                    }
 
                     Spacer()
                 }
                 .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
                 .padding(.top, 16)
+                .padding(.bottom, LiquidMetrics.scrollBottomPadding)
             }
             .navigationTitle("输入链接")
             .navigationBarTitleDisplayMode(.inline)
@@ -502,7 +693,7 @@ private struct ManualLinkInputSheet: View {
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
     }
 }

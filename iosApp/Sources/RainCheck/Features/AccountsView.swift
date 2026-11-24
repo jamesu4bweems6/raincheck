@@ -85,18 +85,28 @@ struct AccountsView: View {
                     } label: {
                         Label("手机号验证码登录", systemImage: "iphone")
                     }
-                    .liquidPrimaryButtonStyle()
+                    .liquidPrimaryButtonStyle(
+                        minWidth: nil,
+                        horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                        fullWidth: true
+                    )
 
                     Button {
                         activeSheet = .manualCreate
                     } label: {
                         Label("手动导入", systemImage: "key.horizontal")
                     }
-                    .liquidSecondaryButtonStyle()
+                    .liquidSecondaryButtonStyle(
+                        minWidth: nil,
+                        horizontalPadding: LiquidMetrics.buttonHorizontalPadding,
+                        fullWidth: true
+                    )
                 }
             }
+            .frame(maxWidth: 340)
         }
         .padding(.horizontal, LiquidMetrics.pageHorizontalPadding)
+        .padding(.bottom, LiquidMetrics.scrollBottomPadding)
     }
 
     private var accountListView: some View {
@@ -155,10 +165,56 @@ struct AccountsView: View {
                 }
             } header: {
                 Text("共 \(store.accounts.count) 个 · 已启用 \(enabledCount) 个")
-                    .font(.footnote)
+                    .font(.footnote.weight(.medium))
+                    .monospacedDigit()
                     .foregroundStyle(LiquidPalette.secondaryText)
                     .textCase(nil)
             }
+
+            Section {
+                LiquidGlassGroup(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button {
+                            activeSheet = .phoneLogin
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "iphone")
+                                Text("验证码登录")
+                            }
+                        }
+                        .liquidPrimaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
+                            fullWidth: true
+                        )
+
+                        Button {
+                            activeSheet = .manualCreate
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "key.horizontal")
+                                Text("手动导入")
+                            }
+                        }
+                        .liquidSecondaryButtonStyle(
+                            minWidth: nil,
+                            horizontalPadding: LiquidMetrics.buttonCompactHorizontalPadding,
+                            fullWidth: true
+                        )
+                    }
+                }
+                .listRowBackground(Color.clear)
+                .listRowInsets(
+                    EdgeInsets(
+                        top: 10,
+                        leading: 0,
+                        bottom: LiquidMetrics.scrollBottomPadding,
+                        trailing: 0
+                    )
+                )
+                .listRowSeparator(.hidden)
+            }
+            .listSectionSeparator(.hidden)
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
@@ -166,11 +222,33 @@ struct AccountsView: View {
 
     private func accountRow(_ account: Account) -> some View {
         let isVerifying = store.verifyingAccountIds.contains(account.id)
+        let isReady = account.enabled && account.hasCredential && account.lastOkAt != nil
 
         return HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
+            Image(systemName: account.enabled ? "person.crop.circle.fill" : "person.crop.circle")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(isReady ? LiquidPalette.accent : LiquidPalette.secondaryText)
+                .frame(width: 38, height: 38)
+                .background(
+                    isReady
+                        ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                        : LiquidPalette.subtleSurface(colorScheme),
+                    in: Circle()
+                )
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            isReady
+                                ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20)
+                                : LiquidPalette.hairline(colorScheme),
+                            lineWidth: 0.75
+                        )
+                        .allowsHitTesting(false)
+                }
+
+            VStack(alignment: .leading, spacing: 5) {
                 Text(account.label)
-                    .font(.body.weight(.medium))
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(account.enabled ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
                     .lineLimit(1)
 
@@ -181,25 +259,12 @@ struct AccountsView: View {
                     .truncationMode(.middle)
 
                 HStack(spacing: 6) {
+                    accountStatusBadge(for: account, isVerifying: isVerifying, isReady: isReady)
+
                     Text(account.authKindLabel)
                         .font(.caption2)
                         .foregroundStyle(LiquidPalette.tertiaryText)
-
-                    Text("·")
-                        .font(.caption2)
-                        .foregroundStyle(LiquidPalette.tertiaryText)
-
-                    if isVerifying {
-                        ProgressView()
-                            .controlSize(.mini)
-                        Text("验证中")
-                            .font(.caption2)
-                            .foregroundStyle(LiquidPalette.secondaryText)
-                    } else {
-                        Text(statusCaption(for: account))
-                            .font(.caption2)
-                            .foregroundStyle(LiquidPalette.secondaryText)
-                    }
+                        .lineLimit(1)
                 }
             }
 
@@ -216,7 +281,40 @@ struct AccountsView: View {
             .tint(LiquidPalette.accent)
             .accessibilityLabel("启用 \(account.label)")
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder
+    private func accountStatusBadge(for account: Account, isVerifying: Bool, isReady: Bool) -> some View {
+        HStack(spacing: 4) {
+            if isVerifying {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("验证中")
+            } else {
+                Text(statusCaption(for: account))
+            }
+        }
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(isReady && !isVerifying ? LiquidPalette.accent : LiquidPalette.secondaryText)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(
+            isReady && !isVerifying
+                ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                : LiquidPalette.subtleSurface(colorScheme),
+            in: Capsule()
+        )
+        .overlay {
+            Capsule()
+                .strokeBorder(
+                    isReady && !isVerifying
+                        ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20)
+                        : LiquidPalette.hairline(colorScheme),
+                    lineWidth: 0.5
+                )
+                .allowsHitTesting(false)
+        }
     }
 
     private func statusCaption(for account: Account) -> String {

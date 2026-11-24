@@ -12,8 +12,8 @@
                 └──────────────► protocol/profile.json ◄───────────────────────┘
                                            │
                         ┌──────────────────┼──────────────────┐
-                   扫码登录轮询         策略链回退签到         会话自愈回填
-             (⚠️外部桌面脚本推断)     白名单护栏 + DRY_RUN     Set-Auth / Set-Cookie
+                 Web 短信 / 扫码登录      策略链回退签到         会话自愈回填
+             (iOS Web / CLI 桌面推断)   白名单护栏 + DRY_RUN     Set-Auth / Set-Cookie
 ```
 
 ## 1. 核心特性
@@ -40,7 +40,7 @@ work/raincheck/
 ├─ iosApp/                     iOS 客户端（SwiftUI iOS 26/27 Liquid Glass + 独立 Swift 引擎 + RainCheckTests）
 ├─ protocol/profile.json       协议单一事实来源（CI 强制与 Android/iOS/CLI 产物逐字节校验）
 ├─ protocol/vectors/           跨端二维码解析测试向量（qr_cases.json，JVM 与 Swift 单测共用）
-├─ tools/mock_server.py        零依赖严格本地演练服务端（双载体鉴权 / source=14 回退 / 登录链 / 会话刷新）
+├─ tools/mock_server.py        零依赖严格本地演练服务端（双载体鉴权 / source=14 回退 / Web 短信与扫码登录 / 会话刷新）
 ├─ tools/demo.py               跨平台 6 组全场景端到端验证（8 账号 16 次回退、严格 ALREADY、401、过期、dry-run、登录）
 ├─ tools/check_artifacts.py    协议同步 / JUnit XML / APK V1+V2+V3 未签名 / iOS YAML 结构化校验工具
 ├─ tools/verify.ps1            Windows 一键离线全量验收脚本
@@ -95,8 +95,9 @@ $cli = "cli\build\install\cli\bin\cli.bat"
 
 完整证据矩阵与风险披露请务必阅读 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。要点如下：
 
-- **IPA 1.3.6 静态实证**：核心生产域（`www`/`pro`/`changjiang`/`huanghe.yuketang.cn`、`www.xuetangx.com`，其中荷塘雨课堂对应 `pro.yuketang.cn`）、双载体鉴权、`Set-Auth`/`Set-Cookie`、`/api/v3/lesson/checkin`、`/api/lesson/web_check_in`、`/wxapi/lesson_check_in`、`/api/v3/app/scan`、`dynamic_qr_error`、`app://yuketang` 等。
-- **`⚠️ 未实网验证（外部桌面脚本推断）`**：扫码登录 4 端点轮询链、桌面端 Header 集合（`xtbz: ykt` / `desktop-v: v2` / `X-Client: desktop` / `Origin: file://`）、动态码 `c/t/s/v` 参数语义及 `source=14/5/1` 请求体均在 IPA 中 0 命中，未经实网抓包验证。
+- **IPA 1.3.6 静态实证**：核心生产域（`www`/`pro`/`changjiang`/`huanghe.yuketang.cn`、`www.xuetangx.com`，其中荷塘雨课堂对应 `pro.yuketang.cn`）、双载体鉴权、`Set-Auth`/`Set-Cookie`、移动端登录路由（`/api/v3/user/code/send`、`/api/v3/user/login/app`）、`/api/v3/lesson/checkin`、`/api/lesson/web_check_in`、`/wxapi/lesson_check_in`、`/api/v3/app/scan`、`dynamic_qr_error`、`app://yuketang` 等。
+- **Web 端协议适配**：统一采用 Web 请求头（`X-Client: web`、`xtbz: ykt`，学堂在线自动切换为 `xt`，动态同源 `Origin`/`Referer`）；iOS 端手机号验证码登录采用 Web PC 端 `/pc/login/send_sms_login_code/` 与 `/pc/login/verify_pwd_login/`（IPA 1.3.6 移动端对应 `/api/v3/user/code/send` + `/api/v3/user/login/app`），且 `authKeywords` 包含 `"登陆"` 与 `"unauthenticated"`。
+- **`⚠️ 未实网验证（外部桌面脚本推断）`**：CLI/Android 扫码登录 4 端点轮询链、动态码 `c/t/s/v` 参数语义及 `source=14/5/1` 请求体均在 IPA 中 0 命中，未经实网抓包验证。
 - **尚未覆盖 / 未决风险**：第一方 1024-bit RSA 加密字段用途、`wss://<host>/wsapp/` 实时长连接、腾讯/hCaptcha 验证码挑战、静态未验证的运行期 TLS 校验，以及未接入的定位签到接口族。
 
 ## 6. 合规声明

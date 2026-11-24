@@ -343,7 +343,15 @@ enum SignState: String, Codable, Hashable, Sendable {
     }
 
     var isSuccessLike: Bool {
-        self == .success || self == .already || self == .dryRun
+        self == .success || self == .already
+    }
+
+    var isDryRun: Bool {
+        self == .dryRun
+    }
+
+    var isFailureLike: Bool {
+        !isSuccessLike && self != .dryRun
     }
 }
 
@@ -617,7 +625,13 @@ enum CredentialSanitizer {
         return false
     }
 
-    static func cleanCookieValue(_ raw: String, key: String) -> String? {
+    /// 从原始 Cookie 字符串、`Cookie:` / `Set-Cookie:` 响应头或单个值中提取目标 Cookie。
+    /// - Parameters:
+    ///   - raw: 原始输入或 `Set-Cookie` 头文本。
+    ///   - key: 目标 Cookie 名称（如 `"sessionid"`、`"csrftoken"`）。
+    ///   - allowBareValue: 是否允许无 `=` 的纯单值回退；解析 HTTP `Set-Cookie` 或跨字段提取 `csrftoken` 时
+    ///     必须传 `false`，仅直接单字段手工输入允许传 `true`。任何不匹配的 `other=val` 键值对均绝不返回。
+    static func cleanCookieValue(_ raw: String, key: String, allowBareValue: Bool = true) -> String? {
         let normalizedNewlines = raw
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -683,40 +697,26 @@ enum CredentialSanitizer {
             }
         }
 
-        let allSegments = entrySegments.flatMap { $0 }
-        if hadCookieHeaderPrefix || cookieEntries.count > 1 || allSegments.count > 1 {
-            if cookieEntries.count == 1, let first = allSegments.first, !first.contains("=") {
-                let cleaned = first.trimmingCharacters(in: quoteAndSpaceSet)
-                if cleaned.isEmpty
-                    || cleaned.caseInsensitiveCompare("deleted") == .orderedSame
-                    || cookieAttributeNames.contains(cleaned.lowercased()) {
-                    return nil
-                }
-                return cleaned
-            }
+        guard allowBareValue else {
             return nil
         }
 
-        if let only = allSegments.first {
-            if let eqIdx = only.firstIndex(of: "=") {
-                let left = String(only[..<eqIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let knownOtherKeys = cookieAttributeNames.union([
-                    "sessionid", "sid", "csrftoken", "csrf_token"
-                ])
-                if knownOtherKeys.contains(left.lowercased()) {
-                    return nil
-                }
-            }
-            let cleaned = only.trimmingCharacters(in: quoteAndSpaceSet)
-            if cleaned.isEmpty
-                || cleaned.caseInsensitiveCompare("deleted") == .orderedSame
-                || cookieAttributeNames.contains(cleaned.lowercased()) {
-                return nil
-            }
-            return cleaned
+        let allSegments = entrySegments.flatMap { $0 }
+        guard !hadCookieHeaderPrefix,
+              cookieEntries.count == 1,
+              allSegments.count == 1,
+              let only = allSegments.first,
+              !only.contains("=") else {
+            return nil
         }
 
-        return nil
+        let cleaned = only.trimmingCharacters(in: quoteAndSpaceSet)
+        if cleaned.isEmpty
+            || cleaned.caseInsensitiveCompare("deleted") == .orderedSame
+            || cookieAttributeNames.contains(cleaned.lowercased()) {
+            return nil
+        }
+        return cleaned
     }
 
     static func cleanHost(_ raw: String) -> (host: String, scheme: String?) {
