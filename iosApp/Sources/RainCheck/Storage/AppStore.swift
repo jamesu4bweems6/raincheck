@@ -17,6 +17,7 @@ final class AppStore: ObservableObject {
 
     let profile: ProtocolProfile
     let loginClient: QrLoginClient
+    let phoneLoginClient: PhoneLoginClient
 
     private let vault: any AccountVaulting
     private let client: RainCheckClient
@@ -28,7 +29,8 @@ final class AppStore: ObservableObject {
     init(
         vault: any AccountVaulting = KeychainVault(),
         profile: ProtocolProfile = ProtocolCatalog.loadBundled(),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        phoneLoginClient: PhoneLoginClient? = nil
     ) {
         self.vault = vault
         self.profile = profile
@@ -37,6 +39,7 @@ final class AppStore: ObservableObject {
         self.client = networkClient
         self.orchestrator = CheckInOrchestrator(client: networkClient, profile: profile)
         self.loginClient = QrLoginClient(session: session, profile: profile)
+        self.phoneLoginClient = phoneLoginClient ?? PhoneLoginClient(session: session, profile: profile)
 
         let loadedAccounts = vault.load()
         self.accounts = loadedAccounts

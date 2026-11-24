@@ -321,4 +321,265 @@ final class QrLoginClientTests: XCTestCase {
         XCTAssertGreaterThan(account.createdAt, 0)
         XCTAssertNil(account.lastOkAt, "basic-info 降级未验证通过时不强行刷新 lastOkAt")
     }
+
+    // MARK: - Long-Poll Fix & Direct HTTPS Flow
+
+    func testShouldSkipWaitForScanDistinguishesHttpsProductionAndLocalMock() throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let client = QrLoginClient(profile: profile)
+
+        for editionId in ["www", "pro", "tsinghua", "changjiang", "huanghe"] {
+            let edition = try XCTUnwrap(profile.edition(editionId), "profile 应包含站点 \(editionId)")
+            XCTAssertTrue(
+                client.shouldSkipWaitForScan(for: edition),
+                "HTTPS 正式站点 \(editionId) (\(edition.baseUrl)) 应跳过 wait-for-scan 直接长轮询 /login"
+            )
+        }
+
+        let mockEdition = try XCTUnwrap(profile.edition("mock"))
+        XCTAssertEqual(mockEdition.scheme, "http")
+        XCTAssertEqual(mockEdition.host, "127.0.0.1:8787")
+        XCTAssertFalse(
+            client.shouldSkipWaitForScan(for: mockEdition),
+            "本地 mock 站点 (http://127.0.0.1:8787) 必须保留 wait-for-scan -> pollLogin 流程"
+        )
+
+        let httpsLoopback = Edition(id: "local-https", label: "Local", host: "127.0.0.1:8787", scheme: "https")
+        let httpsLocalhost = Edition(id: "localhost-https", label: "Localhost", host: "localhost:8787", scheme: "https")
+        let httpRemote = Edition(id: "http-www", label: "HTTP", host: "www.yuketang.cn", scheme: "http")
+        XCTAssertFalse(client.shouldSkipWaitForScan(for: httpsLoopback))
+        XCTAssertFalse(client.shouldSkipWaitForScan(for: httpsLocalhost))
+        XCTAssertFalse(client.shouldSkipWaitForScan(for: httpRemote))
+    }
+
+    func testLongPollEndpointsUse75sTimeoutWhileNormalEndpointsKeep25s() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+        let recordedTimeouts = LockedBox<[String: TimeInterval]>([:])
+
+        let client = makeClient(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            recordedTimeouts.withLock { $0[path] = request.timeoutInterval }
+
+            switch path {
+            case "/api/v3/user/login/pre-info":
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"qrContent":"http://weixin.qq.com/q/timeout-check","token":"lt-timeout"}}"#
+                )
+            case "/api/v3/user/login/wait-for-scan":
+                return .json(200, #"{"code":0,"msg":"已扫码","data":{"scanned":true}}"#)
+            case "/api/v3/user/login":
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"ok":true}}"#,
+                    headers: ["set-auth": "Bearer timeout-check-tok"]
+                )
+            case "/api/v3/user/login/login-with-code":
+                return .json(200, #"{"code":40004,"msg":"验证码错误"}"#)
+            case "/api/v3/user/basic-info":
+                return .json(200, #"{"code":0,"data":{"id":"u-to","name":"超时校验"}}"#)
+            default:
+                return .json(404, #"{"code":40400}"#)
+            }
+        }
+
+        let session = try await client.startSession(edition: edition)
+        let waitOutcome = await client.waitForScan(session: session)
+        XCTAssertEqual(waitOutcome, .scanned)
+
+        let codeOutcome = await client.submitCode(session: session, code: "1234")
+        guard case .needsCode = codeOutcome else {
+            XCTFail("预期 submitCode 返回 .needsCode，实际为 \(codeOutcome)")
+            return
+        }
+
+        let pollOutcome = await client.pollLogin(session: session)
+        guard case .authenticated = pollOutcome else {
+            XCTFail("预期 pollLogin 返回 .authenticated，实际为 \(pollOutcome)")
+            return
+        }
+
+        let timeouts = recordedTimeouts.get()
+        XCTAssertEqual(timeouts["/api/v3/user/login/pre-info"], 25)
+        XCTAssertEqual(timeouts["/api/v3/user/login/login-with-code"], 25)
+        XCTAssertEqual(timeouts["/api/v3/user/basic-info"], 25)
+
+        let waitTimeout = try XCTUnwrap(timeouts["/api/v3/user/login/wait-for-scan"])
+        XCTAssertGreaterThanOrEqual(waitTimeout, 70, "loginWait 超时必须 >= 70s 以覆盖服务端 30s 长轮询")
+        XCTAssertEqual(waitTimeout, 75)
+
+        let pollTimeout = try XCTUnwrap(timeouts["/api/v3/user/login"])
+        XCTAssertGreaterThanOrEqual(pollTimeout, 70, "loginPoll 超时必须 >= 70s 以覆盖服务端 30s 长轮询")
+        XCTAssertEqual(pollTimeout, 75)
+    }
+
+    func testLongPollTimeoutsAndExpiryResponsesMapToExpiredNotFailed() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+
+        struct ExpiryScenario: Sendable {
+            let name: String
+            let handler: @Sendable (URLRequest) throws -> MockHTTPResponse
+        }
+
+        let scenarios: [ExpiryScenario] = [
+            ExpiryScenario(
+                name: "code 50001 SCAN_QR_CODE_TIMEOUT",
+                handler: { _ in
+                    .json(200, #"{"code":50001,"msg":"SCAN_QR_CODE_TIMEOUT","data":{}}"#)
+                }
+            ),
+            ExpiryScenario(
+                name: "HTTP 504 Gateway Timeout",
+                handler: { _ in
+                    .text(504, "504 Gateway Time-out", contentType: "text/html")
+                }
+            ),
+            ExpiryScenario(
+                name: "HTTP 400 code 50400 BAD_REQUEST",
+                handler: { _ in
+                    .json(400, #"{"code":50400,"msg":"BAD_REQUEST","data":null}"#)
+                }
+            ),
+            ExpiryScenario(
+                name: "URLError.timedOut",
+                handler: { _ in
+                    throw URLError(.timedOut)
+                }
+            )
+        ]
+
+        for scenario in scenarios {
+            let client = makeClient(profile: profile, handler: scenario.handler)
+
+            let waitSession = QrLoginSession(
+                edition: edition,
+                loginToken: "lt-wait-\(scenario.name)",
+                qrContent: "http://weixin.qq.com/q/exp"
+            )
+            let waitOutcome = await client.waitForScan(session: waitSession)
+            switch waitOutcome {
+            case .expired(let msg):
+                XCTAssertFalse(msg.isEmpty, "\(scenario.name): waitForScan 过期提示不应为空")
+                XCTAssertFalse(msg.contains("查询扫码状态异常"), "\(scenario.name): 不应退化为查询扫码状态异常")
+            default:
+                XCTFail("\(scenario.name): 预期 waitForScan 返回 .expired，实际为 \(waitOutcome)")
+            }
+
+            let pollSession = QrLoginSession(
+                edition: edition,
+                loginToken: "lt-poll-\(scenario.name)",
+                qrContent: "http://weixin.qq.com/q/exp"
+            )
+            let pollOutcome = await client.pollLogin(session: pollSession)
+            switch pollOutcome {
+            case .expired(let msg):
+                XCTAssertFalse(msg.isEmpty, "\(scenario.name): pollLogin 过期提示不应为空")
+                XCTAssertFalse(msg.contains("查询扫码状态异常"), "\(scenario.name): 不应退化为查询扫码状态异常")
+            default:
+                XCTFail("\(scenario.name): 预期 pollLogin 返回 .expired，实际为 \(pollOutcome)")
+            }
+        }
+
+        // 非超时的真实网络连接错误仍须归类为 .failed，避免掩盖断网故障
+        let offlineClient = makeClient(profile: profile) { _ in
+            throw URLError(.cannotConnectToHost)
+        }
+        let offlineSession = QrLoginSession(edition: edition, loginToken: "lt-offline", qrContent: "http://weixin.qq.com/q/off")
+        let offlineWait = await offlineClient.waitForScan(session: offlineSession)
+        guard case .failed = offlineWait else {
+            XCTFail("非超时传输故障应返回 .failed，实际为 \(offlineWait)")
+            return
+        }
+    }
+
+    func testDirectHttpsStartSessionToPollLoginHappyPathWithoutWaitForScan() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let edition = try XCTUnwrap(profile.edition("www"))
+
+        let requestedPaths = LockedBox<[String]>([])
+        let pollBodyToken = LockedBox<String?>(nil)
+        let pollTimeoutSeen = LockedBox<TimeInterval?>(nil)
+        let basicInfoAuthSeen = LockedBox<String?>(nil)
+
+        let client = makeClient(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            requestedPaths.withLock { $0.append(path) }
+
+            switch path {
+            case "/api/v3/user/login/pre-info":
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"qrContent":"http://weixin.qq.com/q/02directHttps","qrImage":"https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=t1","token":"jwt-direct-https"}}"#
+                )
+            case "/api/v3/user/login/wait-for-scan":
+                return .json(500, #"{"code":500,"msg":"should not call wait-for-scan on HTTPS"}"#)
+            case "/api/v3/user/login":
+                pollTimeoutSeen.set(request.timeoutInterval)
+                pollBodyToken.set(MockNetworkSupport.requestBodyJSON(from: request)?["token"]?.stringValue)
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{}}"#,
+                    headers: ["set-auth": "Bearer direct-https-jwt"]
+                )
+            case "/api/v3/user/basic-info":
+                basicInfoAuthSeen.set(MockNetworkSupport.headerValue("Authorization", in: request))
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"","data":{"id":"u777","name":"张同学"}}"#
+                )
+            default:
+                return .json(404, #"{"code":40400}"#)
+            }
+        }
+
+        XCTAssertTrue(client.shouldSkipWaitForScan(for: edition))
+
+        let session = try await client.startSession(edition: edition)
+        XCTAssertEqual(session.loginToken, "jwt-direct-https")
+        XCTAssertEqual(session.qrContent, "http://weixin.qq.com/q/02directHttps")
+        XCTAssertTrue(session.cookies.isEmpty)
+
+        let outcome = await client.pollLogin(session: session)
+        guard case .authenticated(let account) = outcome else {
+            XCTFail("HTTPS 直连 startSession -> pollLogin 预期返回 .authenticated，实际为 \(outcome)")
+            return
+        }
+
+        let paths = requestedPaths.get()
+        XCTAssertEqual(paths, ["/api/v3/user/login/pre-info", "/api/v3/user/login", "/api/v3/user/basic-info"])
+        XCTAssertFalse(paths.contains("/api/v3/user/login/wait-for-scan"))
+        XCTAssertEqual(pollBodyToken.get(), "jwt-direct-https")
+        XCTAssertEqual(pollTimeoutSeen.get(), 75)
+        XCTAssertEqual(basicInfoAuthSeen.get(), "Bearer direct-https-jwt")
+
+        XCTAssertEqual(account.bearer, "direct-https-jwt")
+        XCTAssertEqual(account.host, "www.yuketang.cn")
+        XCTAssertEqual(account.scheme, "https")
+        XCTAssertEqual(account.userId, "u777")
+        XCTAssertEqual(account.label, "张同学")
+        XCTAssertTrue(account.hasCredential)
+        XCTAssertNotNil(account.lastOkAt)
+    }
+
+    func testStartSessionRejectsXuetangxUnauthenticatedWithClearError() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let xuetangx = try XCTUnwrap(profile.edition("xuetangx"))
+
+        let client = makeClient(profile: profile) { _ in
+            .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+        }
+
+        do {
+            _ = try await client.startSession(edition: xuetangx)
+            XCTFail("学堂在线返回 50000 UNAUTHENTICATED 应抛出明确中文错误")
+        } catch let error as QrLoginError {
+            guard case .failed(let msg) = error else {
+                XCTFail("预期返回 QrLoginError.failed，实际为 \(error)")
+                return
+            }
+            XCTAssertTrue(msg.contains("学堂在线"), "错误提示应明确告知学堂在线不支持微信扫码登录，实际为 \(msg)")
+        }
+    }
 }

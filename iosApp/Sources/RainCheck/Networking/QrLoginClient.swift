@@ -55,8 +55,14 @@ enum QrLoginError: Error, LocalizedError, Equatable, Sendable {
     }
 }
 
-/// 扫码登录协议客户端（与 Kotlin `LoginService.kt` 完整对齐）。
+/// 扫码登录协议客户端（与 Kotlin `LoginService.kt` 及官方长轮询协议对齐）。
 final class QrLoginClient: Sendable {
+    /// 服务端 `/wait-for-scan` 与 `/login` 均为 ~30s 长轮询，客户端超时需大于服务端（官方 Web 为 70.2s）。
+    static let longPollTimeoutInterval: TimeInterval = 75
+
+    private static let expiredBusinessCodes: Set<Int> = [500, 50000, 50001, 50400]
+    private static let defaultExpiredMessage = "二维码已过期，正在刷新"
+
     let client: RainCheckClient
     let profile: ProtocolProfile
     private let stateCache = LoginPreAuthCache()
@@ -66,13 +72,43 @@ final class QrLoginClient: Sendable {
         self.client = RainCheckClient(session: session, profile: profile)
     }
 
+    /// 真实 HTTPS 雨课堂站点直接长轮询 `loginPoll`（与官方 `authorize.js` 一致）；
+    /// 本地 `mock` / HTTP 调试站点保留 `waitForScan -> pollLogin` 流程以兼容 `mock_server.py`。
+    func shouldSkipWaitForScan(for edition: Edition) -> Bool {
+        let scheme = edition.scheme.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard scheme == "https" else {
+            return false
+        }
+        if edition.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "mock" {
+            return false
+        }
+        let rawHost = edition.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let parsedHost = URLComponents(string: "\(scheme)://\(rawHost)")?.host?.lowercased() ?? rawHost
+        if parsedHost.isEmpty
+            || parsedHost == "127.0.0.1"
+            || parsedHost == "localhost"
+            || parsedHost == "::1"
+            || parsedHost.hasSuffix(".local") {
+            return false
+        }
+        return true
+    }
+
     /// 1. 发起扫码登录（`loginPre`），保存前置 Set-Cookie 并返回二维码内容与 token。
     func startSession(edition: Edition) async throws -> QrLoginSession {
         let pseudo = pseudoAccount(for: edition)
         let result = await client.callEndpoint("loginPre", account: pseudo, variables: [:])
 
+        if result.isCancelled || Task.isCancelled {
+            throw CancellationError()
+        }
+
         if !result.ok {
-            let message = result.message ?? "获取登录二维码失败 (HTTP \(result.httpStatus))"
+            if isUnsupportedQrEdition(edition, result: result) {
+                throw QrLoginError.failed("学堂在线暂不支持微信扫码登录，请改用雨课堂各站点或手动导入")
+            }
+            let message = result.message
+                ?? (result.isTimeout ? "获取登录二维码超时，请重试" : "获取登录二维码失败 (HTTP \(result.httpStatus))")
             if (200...299).contains(result.httpStatus) && isExpired(result) {
                 throw QrLoginError.expired(message)
             }
@@ -100,7 +136,7 @@ final class QrLoginClient: Sendable {
         )
     }
 
-    /// 2. 推进扫码等待（`loginWait`），自动透传并累计 `pre-info` 获得的 Cookie。
+    /// 2. 推进扫码等待（`loginWait`），使用 75s 长轮询超时并自动透传累计的 Cookie。
     func waitForScan(session: QrLoginSession) async -> QrLoginPollOutcome {
         let pseudo = pseudoAccount(for: session.edition)
         let snapshot = stateCache.snapshot(for: session)
@@ -110,8 +146,13 @@ final class QrLoginClient: Sendable {
             "loginWait",
             account: pseudo,
             variables: vars,
-            extraCookies: snapshot.cookies
+            extraCookies: snapshot.cookies,
+            timeoutInterval: Self.longPollTimeoutInterval
         )
+
+        if wait.isCancelled || Task.isCancelled {
+            return .pending
+        }
 
         let updatedCookies = mergedCookies(base: snapshot.cookies, update: wait.responseCookies, auth: wait.authUpdate)
         let updatedBearer = nonEmpty(wait.authUpdate?.bearer) ?? snapshot.bearer
@@ -122,13 +163,13 @@ final class QrLoginClient: Sendable {
             cookies: updatedCookies
         )
 
+        // 过期与长轮询超时优先级高于通用传输异常与 needsCode
+        if isLongPollExpired(wait) {
+            stateCache.remove(sessionKey: session.loginToken)
+            return .expired(expiredMessage(for: wait))
+        }
         if isTransportOrServerError(wait) {
             return .failed(wait.message ?? "查询扫码状态异常 (HTTP \(wait.httpStatus))")
-        }
-        // 过期优先级高于 needsCode
-        if isExpired(wait) {
-            stateCache.remove(sessionKey: session.loginToken)
-            return .expired(wait.message ?? "二维码已失效")
         }
         if needsCode(wait) {
             let nextToken = verifyToken(of: wait) ?? snapshot.effectiveToken
@@ -146,7 +187,7 @@ final class QrLoginClient: Sendable {
         return .pending
     }
 
-    /// 3. 轮询并换取正式会话（`loginPoll`）。
+    /// 3. 轮询并换取正式会话（`loginPoll`），使用 75s 长轮询超时。
     func pollLogin(session: QrLoginSession) async -> QrLoginPollOutcome {
         let pseudo = pseudoAccount(for: session.edition)
         let snapshot = stateCache.snapshot(for: session)
@@ -156,8 +197,13 @@ final class QrLoginClient: Sendable {
             "loginPoll",
             account: pseudo,
             variables: vars,
-            extraCookies: snapshot.cookies
+            extraCookies: snapshot.cookies,
+            timeoutInterval: Self.longPollTimeoutInterval
         )
+
+        if poll.isCancelled || Task.isCancelled {
+            return .pending
+        }
 
         let updatedCookies = mergedCookies(base: snapshot.cookies, update: poll.responseCookies, auth: poll.authUpdate)
         let updatedBearer = nonEmpty(poll.authUpdate?.bearer) ?? snapshot.bearer
@@ -168,12 +214,13 @@ final class QrLoginClient: Sendable {
             cookies: updatedCookies
         )
 
+        // 过期与长轮询超时优先级高于通用传输异常与 needsCode
+        if isLongPollExpired(poll) {
+            stateCache.remove(sessionKey: session.loginToken)
+            return .expired(expiredMessage(for: poll))
+        }
         if isTransportOrServerError(poll) {
             return .failed(poll.message ?? "登录轮询异常 (HTTP \(poll.httpStatus))")
-        }
-        if isExpired(poll) {
-            stateCache.remove(sessionKey: session.loginToken)
-            return .expired(poll.message ?? "二维码已失效")
         }
         if needsCode(poll) {
             let nextToken = verifyToken(of: poll) ?? snapshot.effectiveToken
@@ -191,6 +238,9 @@ final class QrLoginClient: Sendable {
                 bearer: updatedBearer,
                 cookies: updatedCookies
             )
+            if Task.isCancelled {
+                return .pending
+            }
             stateCache.remove(sessionKey: session.loginToken)
             guard let account = finalized else {
                 return .failed("登录响应成功但未返回有效会话凭据（set-auth / Set-Cookie）")
@@ -224,15 +274,19 @@ final class QrLoginClient: Sendable {
             extraCookies: snapshot.cookies
         )
 
+        if result.isCancelled || Task.isCancelled {
+            return .pending
+        }
+
         let updatedCookies = mergedCookies(base: snapshot.cookies, update: result.responseCookies, auth: result.authUpdate)
         let updatedBearer = nonEmpty(result.authUpdate?.bearer) ?? snapshot.bearer
 
-        if isTransportOrServerError(result) {
-            return .failed(result.message ?? "提交验证码网络异常 (HTTP \(result.httpStatus))")
-        }
         if isExpired(result) {
             stateCache.remove(sessionKey: session.loginToken)
-            return .expired(result.message ?? "二维码已失效")
+            return .expired(expiredMessage(for: result))
+        }
+        if isTransportOrServerError(result) {
+            return .failed(result.message ?? "提交验证码网络异常 (HTTP \(result.httpStatus))")
         }
         if result.ok {
             let finalized = await finalizeAccount(
@@ -240,6 +294,9 @@ final class QrLoginClient: Sendable {
                 bearer: updatedBearer,
                 cookies: updatedCookies
             )
+            if Task.isCancelled {
+                return .pending
+            }
             stateCache.remove(sessionKey: session.loginToken)
             guard let account = finalized else {
                 return .failed("验证码校验通过但服务端未返回有效会话凭据")
@@ -312,6 +369,9 @@ final class QrLoginClient: Sendable {
             enriched.lastOkAt = RainCheckTime.nowMillis()
             return enriched
         } catch {
+            if RainCheckClient.isCancellationError(error) || Task.isCancelled {
+                return nil
+            }
             // `basic-info` 降级时仍保留刚获取到的有效会话凭据，避免用户白扫一次
             return candidate
         }
@@ -326,6 +386,23 @@ final class QrLoginClient: Sendable {
             host: edition.host,
             scheme: edition.scheme
         )
+    }
+
+    private func isUnsupportedQrEdition(_ edition: Edition, result: ApiCallResult) -> Bool {
+        let isXuetangx = edition.host
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .contains("xuetangx.com")
+        guard isXuetangx else { return false }
+
+        if result.businessCode == 50000 || result.httpStatus == 401 {
+            return true
+        }
+        if let msg = nonEmpty(result.message),
+           msg.caseInsensitiveCompare("UNAUTHENTICATED") == .orderedSame {
+            return true
+        }
+        return false
     }
 
     private func needsCode(_ result: ApiCallResult) -> Bool {
@@ -374,14 +451,40 @@ final class QrLoginClient: Sendable {
         return false
     }
 
+    private func isLongPollExpired(_ result: ApiCallResult) -> Bool {
+        if result.isTimeout || result.httpStatus == 504 {
+            return true
+        }
+        if result.httpStatus == 400 {
+            if result.businessCode == 50400 {
+                return true
+            }
+            if let msg = nonEmpty(result.message),
+               msg.caseInsensitiveCompare("BAD_REQUEST") == .orderedSame {
+                return true
+            }
+        }
+        return isExpired(result)
+    }
+
     private func isExpired(_ result: ApiCallResult) -> Bool {
         if result.httpStatus == 401 || result.httpStatus == 403 {
             return true
         }
-        if let code = result.businessCode, code == 50000 || code == 50001 {
+        if let code = result.businessCode, Self.expiredBusinessCodes.contains(code) {
             return true
         }
         return matchesExpiredKeyword(result.message ?? "")
+    }
+
+    private func expiredMessage(for result: ApiCallResult) -> String {
+        if result.isTimeout || result.httpStatus == 504 || result.httpStatus == 400 {
+            return Self.defaultExpiredMessage
+        }
+        if let code = result.businessCode, Self.expiredBusinessCodes.contains(code) {
+            return Self.defaultExpiredMessage
+        }
+        return nonEmpty(result.message) ?? Self.defaultExpiredMessage
     }
 
     private func matchesExpiredKeyword(_ text: String) -> Bool {

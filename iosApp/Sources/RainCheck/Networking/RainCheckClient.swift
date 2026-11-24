@@ -50,6 +50,38 @@ struct ApiCallResult: Sendable {
     let ok: Bool
     let requestMethod: String
     let requestUrl: String
+    let isTimeout: Bool
+    let isCancelled: Bool
+
+    init(
+        httpStatus: Int,
+        bodyText: String,
+        jsonObject: [String: TemplateValue]?,
+        businessCode: Int?,
+        message: String?,
+        elapsedMs: Int64,
+        authUpdate: AuthUpdate?,
+        responseCookies: [String: String],
+        ok: Bool,
+        requestMethod: String,
+        requestUrl: String,
+        isTimeout: Bool = false,
+        isCancelled: Bool = false
+    ) {
+        self.httpStatus = httpStatus
+        self.bodyText = bodyText
+        self.jsonObject = jsonObject
+        self.businessCode = businessCode
+        self.message = message
+        self.elapsedMs = elapsedMs
+        self.authUpdate = authUpdate
+        self.responseCookies = responseCookies
+        self.ok = ok
+        self.requestMethod = requestMethod
+        self.requestUrl = requestUrl
+        self.isTimeout = isTimeout
+        self.isCancelled = isCancelled
+    }
 
     var dataObject: [String: TemplateValue]? {
         jsonObject?["data"]?.objectValue
@@ -96,6 +128,8 @@ enum RainCheckClientError: Error, LocalizedError, Sendable {
 
 /// 纯 Foundation 网络客户端（无第三方依赖、严格账号 Cookie 隔离、规避 CFBoolean JSON 陷阱）。
 final class RainCheckClient: Sendable {
+    static let defaultTimeoutInterval: TimeInterval = 25
+
     let session: URLSession
     let profile: ProtocolProfile
 
@@ -104,9 +138,31 @@ final class RainCheckClient: Sendable {
         self.profile = profile
     }
 
+    static func isTimeoutError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut
+    }
+
+    static func isCancellationError(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
     /// 校验账号会话并拉取用户基本信息（`me` 接口）。
     func fetchMe(account: Account) async throws -> VerifiedProfile {
         let result = await callEndpoint("me", account: account, variables: [:])
+        if result.isCancelled || Task.isCancelled {
+            throw CancellationError()
+        }
         if result.httpStatus == -1 {
             throw RainCheckClientError.networkError(result.bodyText)
         }
@@ -143,7 +199,8 @@ final class RainCheckClient: Sendable {
         _ endpointKey: String,
         account: Account,
         variables: [String: TemplateValue] = [:],
-        extraCookies: [String: String] = [:]
+        extraCookies: [String: String] = [:],
+        timeoutInterval: TimeInterval? = nil
     ) async -> ApiCallResult {
         await executeEndpoint(
             endpointKey,
@@ -151,18 +208,20 @@ final class RainCheckClient: Sendable {
             variables: variables,
             extraCookies: extraCookies,
             referer: nil,
-            extraHeaders: [:]
+            extraHeaders: [:],
+            timeoutInterval: timeoutInterval
         )
     }
 
-    /// 内部扩展版本，支持附带 `Referer` 与额外请求头。
+    /// 内部扩展版本，支持附带 `Referer`、额外请求头与自定义超时时间。
     func executeEndpoint(
         _ endpointKey: String,
         account: Account,
         variables: [String: TemplateValue],
         extraCookies: [String: String],
         referer: String?,
-        extraHeaders: [String: String]
+        extraHeaders: [String: String],
+        timeoutInterval: TimeInterval? = nil
     ) async -> ApiCallResult {
         guard let endpoint = profile.endpoint(endpointKey) else {
             return ApiCallResult(
@@ -193,7 +252,8 @@ final class RainCheckClient: Sendable {
             body: renderedBody,
             extraCookies: extraCookies,
             referer: referer,
-            extraHeaders: extraHeaders
+            extraHeaders: extraHeaders,
+            timeoutInterval: timeoutInterval
         )
     }
 
@@ -206,7 +266,8 @@ final class RainCheckClient: Sendable {
             body: nil,
             extraCookies: [:],
             referer: nil,
-            extraHeaders: [:]
+            extraHeaders: [:],
+            timeoutInterval: nil
         )
     }
 
@@ -224,7 +285,8 @@ final class RainCheckClient: Sendable {
             body: body,
             extraCookies: [:],
             referer: referer,
-            extraHeaders: [:]
+            extraHeaders: [:],
+            timeoutInterval: nil
         )
     }
 
@@ -254,7 +316,8 @@ final class RainCheckClient: Sendable {
         body: [String: TemplateValue]?,
         extraCookies: [String: String],
         referer: String?,
-        extraHeaders: [String: String]
+        extraHeaders: [String: String],
+        timeoutInterval: TimeInterval? = nil
     ) async -> ApiCallResult {
         let normalizedMethod = method.uppercased()
         let startedMs = RainCheckTime.nowMillis()
@@ -277,7 +340,8 @@ final class RainCheckClient: Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = normalizedMethod
-        request.timeoutInterval = 25
+        let resolvedTimeout = timeoutInterval ?? Self.defaultTimeoutInterval
+        request.timeoutInterval = resolvedTimeout > 0 ? resolvedTimeout : Self.defaultTimeoutInterval
         // 禁用系统共享 Cookie 池，彻底避免多账号并发串号或单测间污染
         request.httpShouldHandleCookies = false
 
@@ -320,6 +384,8 @@ final class RainCheckClient: Sendable {
             (data, response) = try await session.data(for: request)
         } catch {
             let elapsed = max(0, RainCheckTime.nowMillis() - startedMs)
+            let cancelled = Self.isCancellationError(error) || Task.isCancelled
+            let timedOut = !cancelled && Self.isTimeoutError(error)
             return ApiCallResult(
                 httpStatus: -1,
                 bodyText: error.localizedDescription,
@@ -331,7 +397,9 @@ final class RainCheckClient: Sendable {
                 responseCookies: [:],
                 ok: false,
                 requestMethod: normalizedMethod,
-                requestUrl: urlString
+                requestUrl: urlString,
+                isTimeout: timedOut,
+                isCancelled: cancelled
             )
         }
 
