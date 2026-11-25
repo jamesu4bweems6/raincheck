@@ -2268,7 +2268,7 @@ final class CheckInOrchestratorTests: XCTestCase {
         // 1) SignResult.withoutCredentials 必须同时脱敏 SignResult.message 与 AttemptTrace.message 中的敏感凭据
         let dirtyResult = SignResult(
             accountId: "acc-dirty",
-            label: "脱敏校验账号",
+            accountLabel: "脱敏校验账号",
             host: "www.yuketang.cn",
             state: .failed,
             strategyId: "APP_SCAN_CHECKIN",
