@@ -633,6 +633,261 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
 
         return lines.joined(separator: "\n")
     }
+
+    /// 返回剥离 `refreshedAccount` 凭据引用并脱敏链路 URL/消息/片段的副本（供历史记录持久化与内存保留）。
+    func withoutCredentials() -> SignResult {
+        let sanitizedMessage = CredentialSanitizer.sanitizeDiagnosticSnippet(message, maxLength: 400) ?? message
+        let sanitizedAttempts = attempts.map { attempt in
+            let safeAttemptMessage = CredentialSanitizer.sanitizeDiagnosticSnippet(attempt.message, maxLength: 400)
+                ?? attempt.message
+            return AttemptTrace(
+                strategyId: attempt.strategyId,
+                method: attempt.method,
+                url: CredentialSanitizer.sanitizeDiagnosticURL(attempt.url),
+                httpStatus: attempt.httpStatus,
+                businessCode: attempt.businessCode,
+                message: safeAttemptMessage,
+                elapsedMs: attempt.elapsedMs,
+                rawSnippet: attempt.rawSnippet.flatMap {
+                    CredentialSanitizer.sanitizeDiagnosticSnippet($0, maxLength: 320)
+                },
+                finalUrl: attempt.finalUrl.map { CredentialSanitizer.sanitizeDiagnosticURL($0) }
+            )
+        }
+        return SignResult(
+            accountId: accountId,
+            accountLabel: accountLabel,
+            host: host,
+            state: state,
+            strategyId: strategyId,
+            httpStatus: httpStatus,
+            businessCode: businessCode,
+            message: sanitizedMessage,
+            elapsedMs: elapsedMs,
+            attempts: sanitizedAttempts,
+            timestampMs: timestampMs,
+            refreshedAccount: nil
+        )
+    }
+}
+
+/// 持久化扫码签到历史批次记录（保留完整脱敏结果、错误原因与 `AttemptTrace` 请求日志，零明文凭据）。
+struct CheckInHistoryEntry: Identifiable, Codable, Hashable, Sendable {
+    let id: String
+    let createdAtMs: Int64
+    let ticketRaw: String
+    let ticketKind: TicketKind
+    let ticketSummary: String
+    let ticketHost: String?
+    let ticketLessonId: String?
+    let ticketCheckinId: String?
+    let dryRun: Bool
+    let results: [SignResult]
+
+    init(
+        id: String = UUID().uuidString,
+        createdAtMs: Int64 = RainCheckTime.nowMillis(),
+        ticketRaw: String,
+        ticketKind: TicketKind,
+        ticketSummary: String,
+        ticketHost: String? = nil,
+        ticketLessonId: String? = nil,
+        ticketCheckinId: String? = nil,
+        dryRun: Bool,
+        results: [SignResult]
+    ) {
+        self.id = id
+        self.createdAtMs = createdAtMs
+        self.ticketRaw = Self.sanitizeTicketRaw(ticketRaw)
+        self.ticketKind = ticketKind
+        let trimmedSummary = ticketSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.ticketSummary = trimmedSummary.isEmpty ? ticketKind.displayTitle : trimmedSummary
+        let trimmedHost = ticketHost?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.ticketHost = (trimmedHost?.isEmpty == false) ? trimmedHost : nil
+        let trimmedLessonId = ticketLessonId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.ticketLessonId = (trimmedLessonId?.isEmpty == false) ? trimmedLessonId : nil
+        let trimmedCheckinId = ticketCheckinId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.ticketCheckinId = (trimmedCheckinId?.isEmpty == false) ? trimmedCheckinId : nil
+        self.dryRun = dryRun
+        self.results = results.map { $0.withoutCredentials() }
+    }
+
+    static func from(
+        ticket: QrTicket,
+        dryRun: Bool,
+        results: [SignResult],
+        id: String = UUID().uuidString,
+        createdAtMs: Int64 = RainCheckTime.nowMillis()
+    ) -> CheckInHistoryEntry {
+        CheckInHistoryEntry(
+            id: id,
+            createdAtMs: createdAtMs,
+            ticketRaw: ticket.raw,
+            ticketKind: ticket.kind,
+            ticketSummary: makeTicketSummary(for: ticket),
+            ticketHost: ticket.host,
+            ticketLessonId: ticket.lessonId,
+            ticketCheckinId: ticket.checkinId,
+            dryRun: dryRun,
+            results: results
+        )
+    }
+
+    static func sanitizeTicketRaw(_ raw: String, maxLength: Int = 300) -> String {
+        let collapsed = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return "" }
+
+        let sanitized: String
+        if collapsed.contains("://") {
+            sanitized = CredentialSanitizer.sanitizeDiagnosticURL(collapsed)
+        } else {
+            sanitized = CredentialSanitizer.sanitizeDiagnosticSnippet(collapsed, maxLength: maxLength) ?? collapsed
+        }
+
+        let safeMax = max(16, maxLength)
+        if sanitized.count <= safeMax {
+            return sanitized
+        }
+        return String(sanitized.prefix(safeMax - 1)) + "…"
+    }
+
+    static func makeTicketSummary(for ticket: QrTicket) -> String {
+        let trimmedLesson = ticket.lessonId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedHost = ticket.host?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch ticket.kind {
+        case .dynamicCheckin:
+            if let lesson = trimmedLesson, !lesson.isEmpty {
+                return "动态签到 · 课堂 \(lesson)"
+            }
+            if let host = trimmedHost, !host.isEmpty {
+                return "\(Edition.fromHost(host).shortLabel) · 动态签到码"
+            }
+            return "动态签到码"
+        case .lessonOnly:
+            if let lesson = trimmedLesson, !lesson.isEmpty {
+                return "课堂签到 · \(lesson)"
+            }
+            if let host = trimmedHost, !host.isEmpty {
+                return "\(Edition.fromHost(host).shortLabel) · 课堂签到"
+            }
+            return "课堂签到"
+        case .login:
+            return "登录二维码"
+        case .unknown:
+            if let host = trimmedHost, !host.isEmpty {
+                return host
+            }
+            return "未识别内容"
+        }
+    }
+
+    var succeededCount: Int {
+        results.filter { $0.state.isSuccessLike }.count
+    }
+
+    var failedCount: Int {
+        results.filter { $0.state.isFailureLike }.count
+    }
+
+    var dryRunCount: Int {
+        results.filter { $0.state.isDryRun }.count
+    }
+
+    var totalCount: Int {
+        results.count
+    }
+
+    var succeededLabels: [String] {
+        results.filter { $0.state.isSuccessLike }.map(\.accountLabel)
+    }
+
+    /// 脱敏多行批次诊断报告（汇总信息 + 逐账号 `diagnosticReportText` 及完整链路）。
+    var diagnosticReportText: String {
+        let formatter = ISO8601DateFormatter()
+        let createdDate = Date(timeIntervalSince1970: TimeInterval(createdAtMs) / 1000.0)
+        var lines: [String] = []
+        lines.append("RainCheck 扫码签到历史（已脱敏）")
+        lines.append("时间: \(formatter.string(from: createdDate))")
+        lines.append("票据: \(ticketSummary) [\(ticketKind.displayTitle)]")
+        if let ticketHost, !ticketHost.isEmpty {
+            lines.append("站点: \(ticketHost)")
+        }
+        if let ticketLessonId, !ticketLessonId.isEmpty {
+            lines.append("课堂ID: \(ticketLessonId)")
+        }
+        if let ticketCheckinId, !ticketCheckinId.isEmpty {
+            lines.append("签到ID: \(ticketCheckinId)")
+        }
+        if !ticketRaw.isEmpty {
+            lines.append("二维码: \(Self.sanitizeTicketRaw(ticketRaw))")
+        }
+        if dryRun {
+            lines.append("模式: 模拟演练（未发起网络请求）")
+            lines.append("汇总: 演练 \(dryRunCount) / \(totalCount)")
+        } else {
+            lines.append("汇总: 成功 \(succeededCount) · 失败 \(failedCount) · 共 \(totalCount)")
+        }
+        if !succeededLabels.isEmpty {
+            lines.append("成功账号: \(succeededLabels.joined(separator: "、"))")
+        }
+
+        for (index, result) in results.enumerated() {
+            lines.append("")
+            lines.append("--- 账号 #\(index + 1): \(result.accountLabel) ---")
+            lines.append(result.diagnosticReportText)
+        }
+
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// 扫码页悬浮窗实时通知模型（用于展示成功账号名单、失败摘要与本轮进度）。
+struct ScannerOverlayNotification: Identifiable, Equatable, Hashable, Sendable {
+    enum Kind: String, Equatable, Hashable, Sendable {
+        case success
+        case partial
+        case failure
+        case info
+        case warning
+    }
+
+    let id: UUID
+    let kind: Kind
+    let title: String
+    let detail: String?
+    let succeededLabels: [String]
+    let failedSummaries: [String]
+    let sessionSucceededCount: Int
+    let sessionTotalCount: Int
+    let timestampMs: Int64
+
+    init(
+        id: UUID = UUID(),
+        kind: Kind,
+        title: String,
+        detail: String? = nil,
+        succeededLabels: [String] = [],
+        failedSummaries: [String] = [],
+        sessionSucceededCount: Int = 0,
+        sessionTotalCount: Int = 0,
+        timestampMs: Int64 = RainCheckTime.nowMillis()
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.succeededLabels = succeededLabels
+        self.failedSummaries = failedSummaries
+        self.sessionSucceededCount = sessionSucceededCount
+        self.sessionTotalCount = sessionTotalCount
+        self.timestampMs = timestampMs
+    }
 }
 
 /// 脱敏签到报告导出载体。
@@ -652,6 +907,30 @@ struct ExportReport: Codable, Sendable {
         self.ticketSummary = ticketSummary
         self.dryRun = dryRun
         self.results = results
+    }
+}
+
+/// 单条历史记录脱敏 JSON 导出载体。
+struct HistoryEntryExportReport: Codable, Sendable {
+    let exportedAt: String
+    let entry: CheckInHistoryEntry
+
+    init(exportedAt: String, entry: CheckInHistoryEntry) {
+        self.exportedAt = exportedAt
+        self.entry = entry
+    }
+}
+
+/// 全量历史记录脱敏 JSON 导出载体。
+struct HistoryExportReport: Codable, Sendable {
+    let exportedAt: String
+    let totalEntries: Int
+    let entries: [CheckInHistoryEntry]
+
+    init(exportedAt: String, totalEntries: Int, entries: [CheckInHistoryEntry]) {
+        self.exportedAt = exportedAt
+        self.totalEntries = totalEntries
+        self.entries = entries
     }
 }
 
@@ -926,7 +1205,7 @@ enum CredentialSanitizer {
         var sanitized = collapsed
         let patterns: [(String, String)] = [
             (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer [REDACTED]"),
-            (#"(?i)\b(sessionid|sid|csrftoken|csrf_token|set-auth|authorization|cookie)\s*[:=]\s*[^;\s,"'}\]]+"#, "$1=[REDACTED]"),
+            (#"(?i)\b(sessionid|sid|csrftoken|csrf_token|set-auth|authorization|cookie)\s*[:=]\s*(?!\[REDACTED\])[^;\s,"'}\]]+"#, "$1=[REDACTED]"),
             (#"(?i)"(bearer|sessionId|sessionid|csrfToken|csrftoken|lessonToken|access_token|refresh_token)"\s*:\s*"[^"]*""#, "\"$1\":\"[REDACTED]\"")
         ]
         for (pattern, replacement) in patterns {
@@ -950,7 +1229,7 @@ enum CredentialSanitizer {
         let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
         var sanitized = trimmed
-        let pattern = #"(?i)([?&])(token|sessionid|sid|csrftoken|csrf_token|authorization|auth|cookie)=([^&#]*)"#
+        let pattern = #"(?i)([?&])(token|bearer|sessionid|sid|csrftoken|csrf_token|authorization|auth|cookie)=([^&#]*)"#
         if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
             let range = NSRange(sanitized.startIndex..<sanitized.endIndex, in: sanitized)
             sanitized = regex.stringByReplacingMatches(in: sanitized, options: [], range: range, withTemplate: "$1$2=[REDACTED]")

@@ -377,3 +377,109 @@ final class InMemoryAccountVault: AccountVaulting, @unchecked Sendable {
         storage.removeAll { $0.id == id }
     }
 }
+
+// MARK: - Check-In History Persistence
+
+/// 扫码签到历史持久化协议（要求线程安全且符合 `Sendable`）。
+protocol CheckInHistoryStoring: Sendable {
+    func load() -> [CheckInHistoryEntry]
+    func save(_ entries: [CheckInHistoryEntry])
+}
+
+/// 文件级扫码签到历史存储：
+/// - 写入 Application Support `RainCheck/checkin_history.json`（`.atomic` + `.completeFileProtection` + `isExcludedFromBackup = true`）
+/// - 仅保存经 `SignResult.CodingKeys` 脱敏的历史记录，最多保留最新 `maxEntries` 条（默认 200）
+/// - 全程由 `NSLock` 串行化，避免并发读写竞态。
+final class FileCheckInHistoryStore: CheckInHistoryStoring, @unchecked Sendable {
+    let fileURL: URL
+    let maxEntries: Int
+    private let lock = NSLock()
+
+    init(
+        fileURL: URL? = nil,
+        maxEntries: Int = 200
+    ) {
+        self.fileURL = fileURL ?? Self.defaultFileURL()
+        self.maxEntries = max(1, maxEntries)
+    }
+
+    func load() -> [CheckInHistoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard FileManager.default.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: fileURL),
+              !data.isEmpty,
+              let entries = try? JSONDecoder().decode([CheckInHistoryEntry].self, from: data) else {
+            return []
+        }
+        return Array(entries.prefix(maxEntries))
+    }
+
+    func save(_ entries: [CheckInHistoryEntry]) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let bounded = Array(entries.prefix(maxEntries))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+
+        guard let data = try? encoder.encode(bounded) else {
+            return
+        }
+
+        let directoryURL = fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        excludeFromBackup(directoryURL)
+
+        try? data.write(to: fileURL, options: [.atomic, .completeFileProtection])
+        excludeFromBackup(fileURL)
+    }
+
+    private func excludeFromBackup(_ url: URL) {
+        var mutableURL = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? mutableURL.setResourceValues(values)
+    }
+
+    private static func defaultFileURL() -> URL {
+        let baseDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseDir
+            .appendingPathComponent("RainCheck", isDirectory: true)
+            .appendingPathComponent("checkin_history.json", isDirectory: false)
+    }
+}
+
+/// 纯内存线程安全历史存储实现（用于 XCTest 隔离磁盘副作用与 SwiftUI 预览）。
+final class InMemoryCheckInHistoryStore: CheckInHistoryStoring, @unchecked Sendable {
+    let maxEntries: Int
+    private let lock = NSLock()
+    private var storage: [CheckInHistoryEntry]
+
+    init(
+        initial: [CheckInHistoryEntry] = [],
+        maxEntries: Int = 200
+    ) {
+        let safeMax = max(1, maxEntries)
+        self.maxEntries = safeMax
+        self.storage = Array(initial.prefix(safeMax))
+    }
+
+    func load() -> [CheckInHistoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func save(_ entries: [CheckInHistoryEntry]) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage = Array(entries.prefix(maxEntries))
+    }
+}

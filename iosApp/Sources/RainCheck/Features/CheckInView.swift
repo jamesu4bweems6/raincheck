@@ -59,10 +59,10 @@ struct CheckInView: View {
     private var scanHeroSubtitle: String {
         if selectedEnabledCount > 0 {
             return store.dryRun
-                ? "支持动态签到码，扫码或相册识码后将自动为已选的 \(selectedEnabledCount) 个账号执行演练。"
-                : "支持动态签到码，扫码或相册识码后将立即为已选的 \(selectedEnabledCount) 个账号自动签到。"
+                ? "支持动态签到码，扫码后留在扫码页持续识别演练已选的 \(selectedEnabledCount) 个账号。"
+                : "支持动态签到码，扫码后留在扫码页持续识别，已成功账号本轮自动跳过不再重复提交。"
         }
-        return "请先在上方勾选至少一个要签到的账号（支持多选），扫码后将自动执行签到。"
+        return "请先在上方勾选至少一个要签到的账号（支持多选），扫码后将留在扫码页持续识别并自动跳过已成功账号。"
     }
 
     var body: some View {
@@ -133,6 +133,7 @@ struct CheckInView: View {
             .fullScreenCover(
                 isPresented: $showScanner,
                 onDismiss: {
+                    store.endScannerSession()
                     if pendingManualPasteAfterScanner {
                         pendingManualPasteAfterScanner = false
                         handlePasteAction()
@@ -140,10 +141,12 @@ struct CheckInView: View {
                 }
             ) {
                 CameraScannerSheet(
+                    store: store,
+                    continuousMode: true,
                     selectedAccountCount: selectedEnabledCount,
                     isDryRun: store.dryRun,
                     onScanned: { raw in
-                        store.applyQrInput(raw, autoStartCheckIn: true)
+                        store.handleContinuousScannerQr(raw)
                     },
                     onManualPaste: {
                         pendingManualPasteAfterScanner = true
@@ -240,6 +243,7 @@ struct CheckInView: View {
                 LiquidGlassGroup(spacing: 10) {
                     HStack(spacing: 10) {
                         Button {
+                            store.beginScannerSession()
                             showScanner = true
                         } label: {
                             Label(

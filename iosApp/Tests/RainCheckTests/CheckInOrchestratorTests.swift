@@ -1695,4 +1695,684 @@ final class CheckInOrchestratorTests: XCTestCase {
         XCTAssertTrue(toast.contains("签到失败（0/1）"), "失败 Toast 应包含失败计数: \(toast)")
         XCTAssertTrue(toast.contains("二维码已过期"), "失败 Toast 必须包含具体失败原因: \(toast)")
     }
+
+    // MARK: - Continuous Scanner Session & Persistent History
+
+    @MainActor
+    private func waitUntilIdle(_ store: AppStore, maxTicks: Int = 150) async throws {
+        var ticks = 0
+        while store.isCheckingIn && ticks < maxTicks {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    @MainActor
+    func testContinuousScannerSessionAutoDisablesSucceededAccountsAndSkipsOnRepeatScan() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let historyStore = InMemoryCheckInHistoryStore()
+
+        let authCalls = LockedBox<[String: Int]>([:])
+        let allowBToSucceed = LockedBox(false)
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            authCalls.withLock { $0[auth, default: 0] += 1 }
+
+            let path = request.url?.path ?? ""
+            if path == "/api/v3/app/scan" {
+                if auth == "Bearer tok-b" && !allowBToSucceed.get() {
+                    return .json(200, #"{"code":51203,"msg":"动态二维码已过期，请重扫"}"#)
+                }
+                return .json(200, #"{"code":0,"data":{"type":"checkin","value":"900001"}}"#)
+            }
+            if path == "/api/v3/lesson/checkin" {
+                return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+            }
+            return .json(404, #"{"code":40400,"msg":"接口不存在"}"#)
+        }
+
+        let store = AppStore(vault: vault, historyStore: historyStore, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-a", label: "张三", bearer: "tok-a"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-b", label: "李四", bearer: "tok-b"))
+
+        let qr1 = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=scan1&t=1763900000&s=sig1"
+        store.beginScannerSession()
+        XCTAssertTrue(store.isScannerSessionActive)
+        XCTAssertEqual(store.scannerSessionTotalCount, 2)
+        XCTAssertEqual(store.scannerSessionSucceededCount, 0)
+        XCTAssertEqual(store.scannerSessionRemainingAccounts.map(\.id), ["acc-a", "acc-b"])
+
+        // 第 1 次扫码：张三成功、李四失败 -> 张三加入本轮已成功禁用名单，悬浮通知点名张三成功并附李四失败摘要
+        store.handleContinuousScannerQr(qr1)
+        try await waitUntilIdle(store)
+
+        XCTAssertEqual(store.scannerSessionSucceededAccountIds, Set(["acc-a"]))
+        XCTAssertEqual(store.scannerSessionSucceededCount, 1)
+        XCTAssertEqual(store.scannerSessionTotalCount, 2)
+        XCTAssertEqual(store.scannerSessionRemainingAccounts.map(\.id), ["acc-b"])
+        XCTAssertEqual(store.scannerSessionSucceededLabels, ["张三"])
+
+        let note1 = try XCTUnwrap(store.scannerOverlayNotification)
+        XCTAssertEqual(note1.kind, .partial)
+        XCTAssertEqual(note1.succeededLabels, ["张三"])
+        XCTAssertEqual(note1.failedSummaries.count, 1)
+        XCTAssertTrue(note1.failedSummaries[0].contains("李四"))
+        XCTAssertTrue(note1.failedSummaries[0].contains("51203") || note1.failedSummaries[0].contains("过期"))
+        XCTAssertEqual(note1.sessionSucceededCount, 1)
+        XCTAssertEqual(note1.sessionTotalCount, 2)
+
+        let aCallsAfterScan1 = authCalls.get()["Bearer tok-a", default: 0]
+        let bCallsAfterScan1 = authCalls.get()["Bearer tok-b", default: 0]
+        XCTAssertEqual(aCallsAfterScan1, 2)
+        XCTAssertEqual(bCallsAfterScan1, 1)
+
+        // 第 2 次再次扫同一个码：仅提交剩余未成功的李四，张三零请求！
+        allowBToSucceed.withLock { $0 = true }
+        store.handleContinuousScannerQr(qr1)
+        try await waitUntilIdle(store)
+
+        XCTAssertEqual(
+            authCalls.get()["Bearer tok-a", default: 0],
+            aCallsAfterScan1,
+            "本轮已成功的账号再次扫同一个码时绝不能发送任何网络请求"
+        )
+        XCTAssertEqual(
+            authCalls.get()["Bearer tok-b", default: 0],
+            bCallsAfterScan1 + 2,
+            "仅剩失败账号应发起请求"
+        )
+        XCTAssertEqual(store.scannerSessionSucceededAccountIds, Set(["acc-a", "acc-b"]))
+        XCTAssertEqual(store.scannerSessionSucceededCount, 2)
+        XCTAssertEqual(store.scannerSessionTotalCount, 2)
+        XCTAssertTrue(store.scannerSessionRemainingAccounts.isEmpty)
+        XCTAssertEqual(store.results.count, 2, "同会话二次补签应保留首次成功账号结果并更新失败账号结果")
+        XCTAssertTrue(store.results.allSatisfy { $0.state.isSuccessLike })
+
+        let note2 = try XCTUnwrap(store.scannerOverlayNotification)
+        XCTAssertEqual(note2.kind, .success)
+        XCTAssertEqual(note2.succeededLabels, ["李四"])
+        XCTAssertTrue(note2.failedSummaries.isEmpty)
+        XCTAssertEqual(note2.sessionSucceededCount, 2)
+        XCTAssertEqual(note2.sessionTotalCount, 2)
+
+        // 第 3 次（全员均已成功）扫同一个码及刷新后的码：必须零请求并弹出全员已完成悬浮通知
+        let callsBeforeScan3 = authCalls.get()
+        store.handleContinuousScannerQr(qr1)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(authCalls.get(), callsBeforeScan3, "全员已成功后再扫同码必须零网络请求")
+
+        let note3 = try XCTUnwrap(store.scannerOverlayNotification)
+        XCTAssertEqual(note3.kind, .success)
+        XCTAssertEqual(note3.title, "本轮所选账号已全部签到成功")
+        XCTAssertEqual(note3.succeededLabels, ["张三", "李四"])
+        XCTAssertEqual(note3.sessionSucceededCount, 2)
+        XCTAssertEqual(note3.sessionTotalCount, 2)
+
+        store.handleContinuousScannerQr("https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=scan2&t=1763900010&s=sig2")
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(authCalls.get(), callsBeforeScan3, "全员已成功后再扫刷新码同样必须零网络请求")
+
+        store.dismissScannerOverlayNotification()
+        XCTAssertNil(store.scannerOverlayNotification)
+        XCTAssertEqual(store.history.count, 2, "两次真实扫码批次应各自保留完整历史记录")
+    }
+
+    @MainActor
+    func testEndAndBeginScannerSessionResetsDisabledAccountsWithoutMutatingAccountPool() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let authCalls = LockedBox<[String: Int]>([:])
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            authCalls.withLock { $0[auth, default: 0] += 1 }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-a", label: "甲同学", bearer: "tok-a"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-b", label: "乙同学", bearer: "tok-b"))
+
+        // 会话 1：两个账号全部签到成功
+        store.beginScannerSession()
+        store.handleContinuousScannerQr("lessonId=3030")
+        try await waitUntilIdle(store)
+
+        XCTAssertEqual(store.scannerSessionSucceededAccountIds, Set(["acc-a", "acc-b"]))
+        XCTAssertEqual(authCalls.get()["Bearer tok-a", default: 0], 1)
+        XCTAssertEqual(authCalls.get()["Bearer tok-b", default: 0], 1)
+        XCTAssertTrue(store.accounts.allSatisfy(\.enabled), "会话级禁用绝不得修改 Account.enabled")
+        XCTAssertEqual(store.selectedAccountIds, Set(["acc-a", "acc-b"]), "会话级禁用绝不得修改 selectedAccountIds")
+
+        // 退出扫码页并重新进入：自动重置会话级已成功禁用名单，账号池状态保持原样
+        store.endScannerSession()
+        XCTAssertFalse(store.isScannerSessionActive)
+        XCTAssertTrue(store.scannerSessionSucceededAccountIds.isEmpty)
+        XCTAssertTrue(store.scannerSessionTargetAccountIds.isEmpty)
+        XCTAssertNil(store.scannerOverlayNotification)
+        XCTAssertTrue(store.accounts.allSatisfy(\.enabled))
+        XCTAssertEqual(store.selectedAccountIds, Set(["acc-a", "acc-b"]))
+
+        store.beginScannerSession()
+        XCTAssertTrue(store.isScannerSessionActive)
+        XCTAssertTrue(store.scannerSessionSucceededAccountIds.isEmpty)
+        XCTAssertEqual(store.scannerSessionRemainingAccounts.map(\.id), ["acc-a", "acc-b"])
+
+        // 会话 2：再次扫码两个账号均恢复提交
+        store.handleContinuousScannerQr("lessonId=3030")
+        try await waitUntilIdle(store)
+
+        XCTAssertEqual(authCalls.get()["Bearer tok-a", default: 0], 2)
+        XCTAssertEqual(authCalls.get()["Bearer tok-b", default: 0], 2)
+        XCTAssertEqual(store.scannerSessionSucceededAccountIds, Set(["acc-a", "acc-b"]))
+    }
+
+    @MainActor
+    func testContinuousScannerGuardsInvalidTicketsAndDryRunDoesNotDisableAccounts() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { _ in
+            requestCount.withLock { $0 += 1 }
+            return .json(200, #"{"code":0,"msg":"不应被调用"}"#)
+        }
+
+        let store = AppStore(vault: vault, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-1", label: "账号1", bearer: "tok-1"))
+        store.beginScannerSession()
+
+        // 1) 空白内容
+        store.handleContinuousScannerQr("   \n\t ")
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 2) 登录二维码
+        store.handleContinuousScannerQr("https://www.yuketang.cn/v2/web/login?scene=xyz999")
+        XCTAssertEqual(store.currentTicket?.kind, .login)
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 3) 未识别内容
+        store.handleContinuousScannerQr("random-non-checkin-qr-payload")
+        XCTAssertEqual(store.currentTicket?.kind, .unknown)
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 4) 非受信任域名
+        store.handleContinuousScannerQr("https://evil.example/api/v3/lesson/check-in/dynamic-qr-code?c=abc&t=1763900000&s=sig")
+        XCTAssertEqual(store.currentTicket?.kind, .dynamicCheckin)
+        XCTAssertFalse(store.isCurrentTicketHostTrusted())
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+
+        // 5) 演练模式：零请求，展示 .info 通知，且不会把账号加入本轮成功禁用名单
+        store.dryRun = true
+        store.handleContinuousScannerQr("https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=dry1&t=1763900000&s=sig1")
+        try await waitUntilIdle(store)
+        XCTAssertEqual(requestCount.get(), 0)
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .info)
+        XCTAssertTrue(store.scannerSessionSucceededAccountIds.isEmpty, "演练模式不得将账号加入本轮成功禁用名单")
+        XCTAssertEqual(store.history.count, 1)
+        XCTAssertEqual(store.history.first?.dryRun, true)
+
+        // 6) 未选择任何账号
+        store.dryRun = false
+        store.selectedAccountIds = []
+        store.handleContinuousScannerQr("lessonId=4040")
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(requestCount.get(), 0)
+    }
+
+    @MainActor
+    func testPersistentCheckInHistorySavesFullTracesReloadsDeletesAndExcludesSecrets() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("raincheck-history-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let historyURL = tempDir.appendingPathComponent("checkin_history.json")
+        let vault = InMemoryAccountVault()
+
+        let session = MockNetworkSupport.makeSession { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/v3/app/scan" {
+                return .json(
+                    200,
+                    #"{"code":51203,"msg":"动态二维码已过期","debug":"sessionid=SECRET_SNIPPET_SID_333"}"#
+                )
+            }
+            return .json(
+                200,
+                #"{"code":0,"msg":"签到成功","note":"Bearer SECRET_SNIPPET_BEARER_888"}"#,
+                headers: ["set-auth": "Bearer SECRET_ROTATED_HIST_999"]
+            )
+        }
+
+        let store = AppStore(
+            vault: vault,
+            historyStore: FileCheckInHistoryStore(fileURL: historyURL),
+            profile: profile,
+            session: session
+        )
+        try store.addOrUpdateAccount(
+            makeAccount(
+                id: "hist-acc-1",
+                label: "测试同学",
+                bearer: "SECRET_ACC_BEARER_111",
+                sessionId: "SECRET_ACC_SID_222",
+                csrfToken: "SECRET_ACC_CSRF_333"
+            )
+        )
+
+        // 批次 1：课堂码签到成功
+        store.applyQrInput("lessonId=7001")
+        store.startCheckIn()
+        try await waitUntilIdle(store)
+
+        // 批次 2：含敏感 token 参数的动态二维码失败（保留完整 AttemptTrace 与 rawSnippet）
+        let rawQrWithSecret = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=dyn2&t=1763900000&s=sig2&lessonId=7002&token=SECRET_URL_TOK_555"
+        store.applyQrInput(rawQrWithSecret)
+        store.startCheckIn()
+        try await waitUntilIdle(store)
+
+        // 1) 内存最新倒序与完整轨迹校验
+        XCTAssertEqual(store.history.count, 2)
+        let latest = store.history[0]
+        let older = store.history[1]
+
+        XCTAssertEqual(latest.ticketKind, .dynamicCheckin)
+        XCTAssertEqual(latest.ticketLessonId, "7002")
+        XCTAssertEqual(latest.ticketHost, "www.yuketang.cn")
+        XCTAssertEqual(latest.succeededCount, 0)
+        XCTAssertEqual(latest.failedCount, 1)
+        XCTAssertEqual(latest.totalCount, 1)
+        XCTAssertTrue(latest.ticketRaw.contains("token=[REDACTED]"), "历史票据 URL 必须脱敏 token 参数")
+        XCTAssertFalse(latest.ticketRaw.contains("SECRET_URL_TOK_555"))
+        XCTAssertNil(latest.results.first?.refreshedAccount)
+        let latestTrace = try XCTUnwrap(latest.results.first?.attempts.first)
+        XCTAssertEqual(latestTrace.strategyId, "APP_SCAN_CHECKIN")
+        XCTAssertEqual(latestTrace.businessCode, 51203)
+        XCTAssertEqual(latestTrace.httpStatus, 200)
+        XCTAssertNotNil(latestTrace.rawSnippet)
+        XCTAssertFalse(latestTrace.rawSnippet?.contains("SECRET_SNIPPET_SID_333") ?? false)
+
+        XCTAssertEqual(older.ticketKind, .lessonOnly)
+        XCTAssertEqual(older.ticketLessonId, "7001")
+        XCTAssertEqual(older.succeededCount, 1)
+        XCTAssertEqual(older.succeededLabels, ["测试同学"])
+        XCTAssertNil(older.results.first?.refreshedAccount)
+
+        // 2) 磁盘 JSON 持久化、零明文凭据与排除 iCloud 备份校验
+        let diskData = try Data(contentsOf: historyURL)
+        let diskText = try XCTUnwrap(String(data: diskData, encoding: .utf8))
+        XCTAssertTrue(diskText.contains("APP_SCAN_CHECKIN"))
+        XCTAssertTrue(diskText.contains("动态二维码已过期"))
+        for secret in [
+            "SECRET_ACC_BEARER_111",
+            "SECRET_ACC_SID_222",
+            "SECRET_ACC_CSRF_333",
+            "SECRET_ROTATED_HIST_999",
+            "SECRET_SNIPPET_BEARER_888",
+            "SECRET_SNIPPET_SID_333",
+            "SECRET_URL_TOK_555"
+        ] {
+            XCTAssertFalse(diskText.contains(secret), "历史磁盘 JSON 绝不能包含任何明文凭据: \(secret)")
+        }
+
+        let jsonArray = try XCTUnwrap(JSONSerialization.jsonObject(with: diskData) as? [[String: Any]])
+        XCTAssertEqual(jsonArray.count, 2)
+        for entryObj in jsonArray {
+            let resultObjs = try XCTUnwrap(entryObj["results"] as? [[String: Any]])
+            for resObj in resultObjs {
+                for forbiddenKey in ["refreshedAccount", "bearer", "sessionId", "csrfToken"] {
+                    XCTAssertNil(resObj[forbiddenKey], "SignResult JSON 绝不能包含敏感键: \(forbiddenKey)")
+                }
+            }
+        }
+
+        let freshHistoryURL = URL(fileURLWithPath: historyURL.path)
+        let resourceValues = try freshHistoryURL.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(resourceValues.isExcludedFromBackup, true)
+
+        let reportText = latest.diagnosticReportText
+        XCTAssertTrue(reportText.contains("测试同学"))
+        XCTAssertTrue(reportText.contains("APP_SCAN_CHECKIN"))
+        XCTAssertFalse(reportText.contains("SECRET_URL_TOK_555"))
+        XCTAssertFalse(reportText.contains("SECRET_SNIPPET_SID_333"))
+
+        // 3) 重新实例化 AppStore 模拟冷启动重载，验证完整轨迹与 rawSnippet 恢复
+        let reloadedStore = AppStore(
+            vault: vault,
+            historyStore: FileCheckInHistoryStore(fileURL: historyURL),
+            profile: profile,
+            session: session
+        )
+        XCTAssertEqual(reloadedStore.history.count, 2)
+        XCTAssertEqual(reloadedStore.history[0].id, latest.id)
+        XCTAssertEqual(reloadedStore.history[0].results.first?.attempts.first?.rawSnippet, latestTrace.rawSnippet)
+        XCTAssertEqual(reloadedStore.history[1].id, older.id)
+
+        // 4) 单条 & 全量脱敏导出验证
+        let singleExportURL = try reloadedStore.exportHistoryEntryReportURL(latest)
+        defer { try? FileManager.default.removeItem(at: singleExportURL) }
+        let singleExportText = try String(contentsOf: singleExportURL, encoding: .utf8)
+        XCTAssertTrue(singleExportText.contains(latest.id))
+        XCTAssertFalse(singleExportText.contains("SECRET_ACC_BEARER_111"))
+
+        let allExportURL = try reloadedStore.exportAllHistoryReportURL()
+        defer { try? FileManager.default.removeItem(at: allExportURL) }
+        let allExportData = try Data(contentsOf: allExportURL)
+        let decodedAll = try JSONDecoder().decode(HistoryExportReport.self, from: allExportData)
+        XCTAssertEqual(decodedAll.totalEntries, 2)
+
+        // 5) 单条删除当前结果 + 单条删除历史记录 + 持久化验证
+        let currentResult = try XCTUnwrap(store.results.first)
+        store.deleteResult(id: currentResult.id)
+        XCTAssertTrue(store.results.isEmpty)
+        XCTAssertNil(store.lastBatchTicket)
+
+        reloadedStore.deleteHistoryEntry(id: latest.id)
+        XCTAssertEqual(reloadedStore.history.map(\.id), [older.id])
+
+        let afterDeleteStore = AppStore(
+            vault: vault,
+            historyStore: FileCheckInHistoryStore(fileURL: historyURL),
+            profile: profile,
+            session: session
+        )
+        XCTAssertEqual(afterDeleteStore.history.map(\.id), [older.id])
+
+        // 6) 清空全部历史记录 + 持久化验证
+        afterDeleteStore.clearHistory()
+        XCTAssertTrue(afterDeleteStore.history.isEmpty)
+
+        let afterClearStore = AppStore(
+            vault: vault,
+            historyStore: FileCheckInHistoryStore(fileURL: historyURL),
+            profile: profile,
+            session: session
+        )
+        XCTAssertTrue(afterClearStore.history.isEmpty)
+
+        // 7) 文件存储上限截断验证（保留最新 maxEntries 条）
+        let cappedURL = tempDir.appendingPathComponent("capped_history.json")
+        let cappedStore = FileCheckInHistoryStore(fileURL: cappedURL, maxEntries: 3)
+        let sampleEntries = (1...5).map { idx in
+            CheckInHistoryEntry(
+                id: "entry-\(idx)",
+                createdAtMs: Int64(1_700_000_000_000 + idx),
+                ticketRaw: "lessonId=\(idx)",
+                ticketKind: .lessonOnly,
+                ticketSummary: "课堂签到 · \(idx)",
+                ticketLessonId: "\(idx)",
+                dryRun: false,
+                results: []
+            )
+        }
+        cappedStore.save(sampleEntries)
+        XCTAssertEqual(cappedStore.load().map(\.id), ["entry-1", "entry-2", "entry-3"])
+    }
+
+    func testContinuousScanDeduplicatorSuppressesSteadySameCodeAndAllowsRotationOrReEntry() {
+        let sec: UInt64 = 1_000_000_000
+        var dedup = ContinuousScanDeduplicator(
+            absenceResetNanoseconds: 1_200_000_000,
+            minRetriggerNanoseconds: 2_000_000_000
+        )
+
+        // 1) 首次扫到 qr1 立即触发
+        XCTAssertTrue(dedup.shouldDeliverLiveScan("qr1", now: 0, isBusy: false))
+
+        // 2) 签到进行中：同码刷新存在时间且返回 false；旋转后的新码在忙碌期也返回 false 且不覆盖 lastDeliveredCode
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr1", now: 200_000_000, isBusy: true))
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr1", now: 500_000_000, isBusy: true))
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr2", now: 700_000_000, isBusy: true))
+        XCTAssertEqual(dedup.lastDeliveredCode, "qr1")
+
+        // 3) 签到结束后若镜头持续对准同一个 qr1（每 150ms 一帧持续 10 秒），绝不周期性重复触发
+        var t: UInt64 = 800_000_000
+        for _ in 0..<70 {
+            XCTAssertFalse(
+                dedup.shouldDeliverLiveScan("qr1", now: t, isBusy: false),
+                "镜头持续对准同一二维码时不应重复触发"
+            )
+            t += 150_000_000
+        }
+
+        // 4) 动态码刷新为 qr2 时零延迟立即触发
+        let rotateAt = t + 100_000_000
+        XCTAssertTrue(dedup.shouldDeliverLiveScan("qr2", now: rotateAt, isBusy: false))
+        XCTAssertEqual(dedup.lastDeliveredCode, "qr2")
+
+        // 5) 短暂失焦 0.4s (< 1.2s) 回到 qr2 不会误重扫
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr2", now: rotateAt + 400_000_000, isBusy: false))
+
+        // 6) 主动移开镜头 1.5s (>= 1.2s) 且距上次触发 >= 2.0s 后再对准 qr2，允许重扫一次，随后持续对准再次静默
+        let reenterAt = rotateAt + 2_500_000_000
+        XCTAssertTrue(dedup.shouldDeliverLiveScan("qr2", now: reenterAt, isBusy: false))
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr2", now: reenterAt + 150_000_000, isBusy: false))
+
+        // 7) 相册手动选图记录与 reset() 行为
+        dedup.recordManualDelivery("qr-photo", now: reenterAt + sec)
+        XCTAssertEqual(dedup.lastDeliveredCode, "qr-photo")
+        XCTAssertFalse(dedup.shouldDeliverLiveScan("qr-photo", now: reenterAt + sec + 200_000_000, isBusy: false))
+
+        dedup.reset()
+        XCTAssertNil(dedup.lastDeliveredCode)
+        XCTAssertTrue(dedup.shouldDeliverLiveScan("qr-photo", now: reenterAt + 2 * sec, isBusy: false))
+    }
+
+    @MainActor
+    func testContinuousScannerPreservesCurrentTicketOnNoOpTracksSkippedCountAndIsolatesSessionReopen() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let historyStore = InMemoryCheckInHistoryStore()
+        let allowB = LockedBox(false)
+        let slowDelay = LockedBox(false)
+        let requestCount = LockedBox(0)
+
+        let session = MockNetworkSupport.makeSession { request in
+            requestCount.withLock { $0 += 1 }
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            if slowDelay.get() {
+                Thread.sleep(forTimeInterval: 0.12)
+            }
+            if auth == "Bearer tok-b" && !allowB.get() {
+                return .json(200, #"{"code":51203,"msg":"动态二维码已过期"}"#)
+            }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, historyStore: historyStore, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-a", label: "张三", bearer: "tok-a"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-b", label: "李四", bearer: "tok-b"))
+
+        // 1) 首扫：张三成功、李四失败 -> activeBatchSkippedCount 应为 0
+        store.beginScannerSession()
+        store.handleContinuousScannerQr("lessonId=8101")
+        XCTAssertEqual(store.activeBatchSkippedCount, 0)
+        try await waitUntilIdle(store)
+        XCTAssertEqual(store.activeBatchSkippedCount, 0)
+
+        // 点击顶部状态胶囊可随时回看本轮已成功自动禁用名单
+        store.dismissScannerOverlayNotification()
+        XCTAssertNil(store.scannerOverlayNotification)
+        store.presentScannerSessionStatusNotification()
+        let statusNote = try XCTUnwrap(store.scannerOverlayNotification)
+        XCTAssertEqual(statusNote.kind, .info)
+        XCTAssertEqual(statusNote.succeededLabels, ["张三"])
+        XCTAssertEqual(statusNote.sessionSucceededCount, 1)
+        XCTAssertEqual(statusNote.sessionTotalCount, 2)
+
+        // 2) 二次扫码：张三自动跳过（activeBatchSkippedCount == 1），仅李四发起请求并成功
+        allowB.set(true)
+        store.handleContinuousScannerQr("lessonId=8102")
+        XCTAssertEqual(store.activeBatchSkippedCount, 1)
+        try await waitUntilIdle(store)
+        XCTAssertEqual(store.activeBatchSkippedCount, 0)
+        XCTAssertEqual(store.currentTicket?.lessonId, "8102")
+        XCTAssertEqual(store.lastBatchTicket?.lessonId, "8102")
+
+        // 3) 全员已成功后扫到新码或误扫无效/登录/非受信任域名码：零请求且绝不覆盖 currentTicket，退出扫码页后首页结果条保持可见
+        let reqsBeforeNoOps = requestCount.get()
+        store.handleContinuousScannerQr("lessonId=8103")
+        XCTAssertEqual(store.currentTicket?.lessonId, "8102", "全员已成功后跳过扫码不得覆盖 currentTicket")
+        XCTAssertEqual(store.lastBatchTicket?.lessonId, "8102")
+        XCTAssertEqual(requestCount.get(), reqsBeforeNoOps)
+
+        store.handleContinuousScannerQr("random-poster-qr")
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertEqual(store.currentTicket?.lessonId, "8102", "本轮已有成功批次时误扫无关码不得覆盖 currentTicket")
+
+        store.handleContinuousScannerQr("https://www.yuketang.cn/v2/web/login?scene=abc")
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertEqual(store.currentTicket?.lessonId, "8102")
+
+        store.handleContinuousScannerQr("https://evil.example/api/v3/lesson/checkin?c=x&t=1763900000&s=y")
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .warning)
+        XCTAssertEqual(store.currentTicket?.lessonId, "8102")
+        XCTAssertEqual(requestCount.get(), reqsBeforeNoOps)
+
+        // 4) 跨会话隔离：会话 1 签到进行中立即关闭并重开会话 2，会话 1 的迟到完成不得污染会话 2 的禁用名单与悬浮通知
+        store.endScannerSession()
+        slowDelay.set(true)
+        store.beginScannerSession()
+        store.handleContinuousScannerQr("lessonId=8201")
+        XCTAssertTrue(store.isCheckingIn)
+
+        store.endScannerSession()
+        store.beginScannerSession()
+        try await waitUntilIdle(store)
+
+        XCTAssertTrue(store.isScannerSessionActive)
+        XCTAssertTrue(
+            store.scannerSessionSucceededAccountIds.isEmpty,
+            "旧扫码会话的延迟完成绝不能污染新扫码会话的自动禁用名单"
+        )
+        XCTAssertNil(
+            store.scannerOverlayNotification,
+            "旧扫码会话的延迟完成绝不能覆盖新扫码会话的悬浮通知"
+        )
+    }
+
+    @MainActor
+    func testCancelCheckInPersistsPartialHistoryAndSanitizesMessagesAndCheckinId() async throws {
+        // 1) SignResult.withoutCredentials 必须同时脱敏 SignResult.message 与 AttemptTrace.message 中的敏感凭据
+        let dirtyResult = SignResult(
+            accountId: "acc-dirty",
+            label: "脱敏校验账号",
+            host: "www.yuketang.cn",
+            state: .failed,
+            strategyId: "APP_SCAN_CHECKIN",
+            httpStatus: 401,
+            businessCode: 401,
+            message: "upstream echoed Authorization: Bearer LEAKED_MSG_BEARER_777 and sessionid=LEAKED_MSG_SID_888",
+            elapsedMs: 42,
+            attempts: [
+                AttemptTrace(
+                    strategyId: "APP_SCAN_CHECKIN",
+                    method: "POST",
+                    url: "https://www.yuketang.cn/api/v3/app/scan?token=LEAKED_URL_TOK_999",
+                    httpStatus: 401,
+                    businessCode: 401,
+                    message: "trace error Bearer LEAKED_TRACE_BEARER_555 csrftoken=LEAKED_TRACE_CSRF_666",
+                    elapsedMs: 42,
+                    rawSnippet: #"{"sessionid":"LEAKED_RAW_SID_444"}"#
+                )
+            ]
+        )
+        let ticketWithCheckin = QrTicket(
+            raw: "https://www.yuketang.cn/api/v3/lesson/checkin?lessonId=9010&checkinId=CHK-2026-01",
+            kind: .lessonOnly,
+            url: "https://www.yuketang.cn/api/v3/lesson/checkin?lessonId=9010&checkinId=CHK-2026-01",
+            host: "www.yuketang.cn",
+            lessonId: "9010",
+            checkinId: "CHK-2026-01"
+        )
+        let entry = CheckInHistoryEntry.from(ticket: ticketWithCheckin, dryRun: false, results: [dirtyResult])
+        XCTAssertEqual(entry.ticketCheckinId, "CHK-2026-01")
+        XCTAssertTrue(entry.diagnosticReportText.contains("签到ID: CHK-2026-01"))
+
+        let encoded = try JSONEncoder().encode(entry)
+        let encodedText = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        for secret in [
+            "LEAKED_MSG_BEARER_777",
+            "LEAKED_MSG_SID_888",
+            "LEAKED_URL_TOK_999",
+            "LEAKED_TRACE_BEARER_555",
+            "LEAKED_TRACE_CSRF_666",
+            "LEAKED_RAW_SID_444"
+        ] {
+            XCTAssertFalse(encodedText.contains(secret), "历史序列化结果绝不能泄露凭据: \(secret)")
+        }
+
+        // 2) 向后兼容：缺少 ticketCheckinId 的旧版历史 JSON 可正常解码
+        let legacyJSON = """
+        {
+          "id": "legacy-entry-1",
+          "createdAtMs": 1763900000000,
+          "ticketRaw": "lessonId=1234",
+          "ticketKind": "LESSON_ONLY",
+          "ticketSummary": "课堂签到 · 1234",
+          "ticketHost": "www.yuketang.cn",
+          "ticketLessonId": "1234",
+          "dryRun": false,
+          "results": []
+        }
+        """
+        let decodedLegacy = try JSONDecoder().decode(CheckInHistoryEntry.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decodedLegacy.id, "legacy-entry-1")
+        XCTAssertNil(decodedLegacy.ticketCheckinId)
+
+        // 3) 批量签到中途取消时，已完成的账号结果仍保留至持久化历史中
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let vault = InMemoryAccountVault()
+        let historyStore = InMemoryCheckInHistoryStore()
+        let fastFinished = LockedBox(false)
+
+        let session = MockNetworkSupport.makeSession { request in
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
+            if auth == "Bearer tok-fast" {
+                fastFinished.set(true)
+                return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+            }
+            if fastFinished.get() {
+                Thread.sleep(forTimeInterval: 0.30)
+            } else {
+                Thread.sleep(forTimeInterval: 0.20)
+            }
+            return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+        }
+
+        let store = AppStore(vault: vault, historyStore: historyStore, profile: profile, session: session)
+        try store.addOrUpdateAccount(makeAccount(id: "acc-fast", label: "先完成账号", bearer: "tok-fast"))
+        try store.addOrUpdateAccount(makeAccount(id: "acc-slow", label: "后完成账号", bearer: "tok-slow"))
+
+        store.beginScannerSession()
+        store.handleContinuousScannerQr("lessonId=9020")
+
+        var ticks = 0
+        while store.checkInCompletedCount < 1 && store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(store.checkInCompletedCount, 1)
+        XCTAssertTrue(store.isCheckingIn)
+
+        store.cancelCheckIn()
+        XCTAssertFalse(store.isCheckingIn)
+        XCTAssertEqual(store.history.count, 1, "中途取消时应保留已完成账号的历史记录")
+        XCTAssertEqual(store.history.first?.results.map(\.accountId), ["acc-fast"])
+        XCTAssertEqual(store.history.first?.succeededCount, 1)
+        XCTAssertEqual(store.scannerOverlayNotification?.kind, .info)
+        XCTAssertEqual(store.scannerOverlayNotification?.succeededLabels, ["先完成账号"])
+    }
 }
