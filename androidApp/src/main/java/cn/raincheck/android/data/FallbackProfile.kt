@@ -14,7 +14,7 @@ import kotlinx.serialization.json.put
 /**
  * `assets/protocol_profile.json` 读取或解析异常时的内置完整兜底配置。
  *
- * 与仓库 `protocol/profile.json` 保持 100% 字段与端点一致（含 7 站点、19 端点、6 策略、
+ * 与仓库 `protocol/profile.json` 保持 100% 字段与端点一致（含 7 站点、21 端点、6 策略、
  * `qr` 白名单及 `result` 双字段兼容规则），保证即使资源损坏也绝不退化安全边界。
  */
 internal object FallbackProfile {
@@ -144,6 +144,22 @@ internal object FallbackProfile {
                 query = linkedMapOf("lesson_id" to "{lessonId}"),
                 auth = true,
                 note = "IPA 实证查询参数名为 lesson_id",
+            ),
+            "appScan" to EndpointSpec(
+                method = "POST",
+                path = "/api/v3/app/scan",
+                body = body("url" to "{qrRaw}"),
+                auth = true,
+                note = "IPA 1.3.6 ARM64 实证：官方扫码第一步，提交原始二维码字符串由服务端校验动态签名并返回 data.type/data.value",
+                headers = linkedMapOf("x-client" to "app"),
+            ),
+            "checkinAppScan" to EndpointSpec(
+                method = "POST",
+                path = "/api/v3/lesson/checkin",
+                body = body("source" to 21, "lessonId" to "{lessonId}", "joinIfNotIn" to true),
+                auth = true,
+                note = "IPA 1.3.6 ARM64 实证：HmsScanPage._postLessonCheckin 第二步，携带 source=21 与 joinIfNotIn=true",
+                headers = linkedMapOf("x-client" to "app"),
             ),
             "checkinTicket" to EndpointSpec(
                 method = "POST",
@@ -275,13 +291,21 @@ internal object FallbackProfile {
         ),
         result = ResultSpec(
             codeField = "code",
-            altCodeKeys = listOf("errcode"),
+            altCodeKeys = listOf("errcode", "error_code", "status_code"),
             okCodes = listOf(0),
             messageFields = listOf("msg", "message"),
-            altMessageKeys = listOf("errmsg"),
+            altMessageKeys = listOf("errmsg", "errormsg", "detail", "error"),
             alreadyKeywords = listOf("已签到", "已经签到", "重复签到", "已参与"),
             authKeywords = listOf("登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"),
-            expiredKeywords = listOf("失效", "过期", "不存在", "二维码已"),
+            expiredKeywords = listOf(
+                "失效",
+                "过期",
+                "不存在",
+                "二维码已",
+                "dynamic qr check in refused",
+                "qr code expired",
+                "expired",
+            ),
             retryHttpStatus = listOf(408, 425, 429, 500, 502, 503, 504),
         ),
     )

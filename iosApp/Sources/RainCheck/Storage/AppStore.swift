@@ -115,10 +115,14 @@ final class AppStore: ObservableObject {
         currentTicket = nil
     }
 
-    /// 校验当前票据域名是否受信任（无 URL 视为安全；有 URL 时须通过白名单或匹配已有账号同源校验）。
+    /// 校验当前票据域名是否受信任（无 URL 视为安全；有 URL 时须通过白名单、官方 `app://yuketang/` 深链或匹配已有账号同源校验）。
     func isCurrentTicketHostTrusted() -> Bool {
         guard let ticket = currentTicket else { return true }
         guard let url = ticket.url, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return true
+        }
+        let lowerUrl = url.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowerUrl.hasPrefix("app://yuketang/") {
             return true
         }
         if QrCodeParser.validateQrUrl(url, account: nil, profile: profile) {
@@ -262,6 +266,12 @@ final class AppStore: ObservableObject {
                 let okCount = batchResults.filter { $0.state.isSuccessLike }.count
                 if capturedDryRun {
                     self.showToast("演练完成：已模拟 \(batchResults.count) 个账号，未发起网络请求")
+                } else if okCount < batchResults.count,
+                          let firstFailed = batchResults.first(where: { $0.state.isFailureLike }) {
+                    self.showToast(
+                        "签到失败（\(okCount)/\(batchResults.count)）：\(firstFailed.diagnosticReason)",
+                        durationSeconds: 4.5
+                    )
                 } else {
                     self.showToast("签到完成：成功 \(okCount) / \(batchResults.count)")
                 }
@@ -373,11 +383,12 @@ final class AppStore: ObservableObject {
 
     // MARK: - Toast
 
-    func showToast(_ message: String) {
+    func showToast(_ message: String, durationSeconds: Double = 2.8) {
         toastTask?.cancel()
         toastMessage = message
+        let nanos = UInt64(max(1.0, durationSeconds) * 1_000_000_000)
         toastTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
             guard !Task.isCancelled else { return }
             self?.toastMessage = nil
         }

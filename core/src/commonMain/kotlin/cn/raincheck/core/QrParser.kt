@@ -46,6 +46,12 @@ object QrParser {
 
         val dynamicKeys = spec.dynamicKeys.filter { it.isNotBlank() }
         val hasDynamic = dynamicKeys.isNotEmpty() && dynamicKeys.all { !query[it].isNullOrBlank() }
+        val isDynamicQrPath = path.contains("dynamic-qr", ignoreCase = true)
+
+        // 明确签到路径信号（含 check-in / checkin / dynamic-qr，绝不因路径含 qrcode/scan 误判为登录码）
+        val isExplicitCheckinPath = isDynamicQrPath ||
+            path.contains("check-in", ignoreCase = true) ||
+            path.contains("checkin", ignoreCase = true)
 
         // 明确登录信号（匹配 path 或特定参数，绝不误匹配 host）
         val isExplicitLogin = path.contains("qrconnect", ignoreCase = true) ||
@@ -53,15 +59,15 @@ object QrParser {
             path.contains("scan-handler", ignoreCase = true) ||
             query.containsKey("qrContent")
 
-        // 宽泛登录路径提示（来自 profile.qr.loginPathHints，仅匹配 path 且优先级低于显式 lessonId）
-        val isBroadLoginPath = spec.loginPathHints.any { hint ->
+        // 宽泛登录路径提示（来自 profile.qr.loginPathHints，仅匹配 path 且优先级低于显式 lessonId 与签到路径）
+        val isBroadLoginPath = !isExplicitCheckinPath && spec.loginPathHints.any { hint ->
             hint.isNotBlank() && path.contains(hint, ignoreCase = true)
         }
 
         val isPureDigits = clean.isNotEmpty() && clean.all { it.isDigit() }
 
         val kind = when {
-            hasDynamic -> TicketKind.DYNAMIC_CHECKIN
+            hasDynamic || isDynamicQrPath -> TicketKind.DYNAMIC_CHECKIN
             isExplicitLogin -> TicketKind.LOGIN
             lessonId != null || classroomId != null || isPureDigits -> TicketKind.LESSON_ONLY
             isBroadLoginPath -> TicketKind.LOGIN

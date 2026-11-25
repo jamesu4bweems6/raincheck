@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(UIKit)
+import UIKit
+#endif
 
 private enum RecordFilter: String, CaseIterable, Hashable, Identifiable, Sendable {
     case all = "全部"
@@ -167,7 +170,7 @@ struct RecordsView: View {
 
     private func resultRow(_ result: SignResult) -> some View {
         let isExpanded = expandedResultIds.contains(result.id)
-        let isSuccessLike = result.state.isSuccessLike
+        let isFailureLike = result.state.isFailureLike
 
         return VStack(alignment: .leading, spacing: 0) {
             Button {
@@ -179,56 +182,75 @@ struct RecordsView: View {
                     }
                 }
             } label: {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: result.state.symbolName)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(isSuccessLike ? LiquidPalette.accent : LiquidPalette.secondaryText)
-                        .frame(width: 34, height: 34)
-                        .background(
-                            isSuccessLike
-                                ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
-                                : LiquidPalette.subtleSurface(colorScheme),
-                            in: Circle()
-                        )
-                        .overlay {
-                            Circle()
-                                .strokeBorder(
-                                    isSuccessLike
-                                        ? LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20)
-                                        : LiquidPalette.hairline(colorScheme),
-                                    lineWidth: 0.75
-                                )
-                                .allowsHitTesting(false)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .center, spacing: 12) {
+                        Image(systemName: result.state.symbolName)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(statusForegroundColor(for: result.state))
+                            .frame(width: 34, height: 34)
+                            .background(statusBadgeFill(for: result.state), in: Circle())
+                            .overlay {
+                                Circle()
+                                    .strokeBorder(statusBadgeBorder(for: result.state), lineWidth: 0.75)
+                                    .allowsHitTesting(false)
+                            }
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(result.accountLabel)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(LiquidPalette.primaryText)
+                                .lineLimit(1)
+
+                            HStack(spacing: 6) {
+                                Text(result.state.displayTitle)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(statusForegroundColor(for: result.state))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(statusBadgeFill(for: result.state), in: Capsule())
+                                    .overlay {
+                                        Capsule()
+                                            .strokeBorder(statusBadgeBorder(for: result.state), lineWidth: 0.6)
+                                            .allowsHitTesting(false)
+                                    }
+                                    .fixedSize(horizontal: true, vertical: false)
+
+                                if !result.host.isEmpty {
+                                    Text(LiquidPalette.editionDisplayName(forHost: result.host))
+                                        .font(.caption2)
+                                        .foregroundStyle(LiquidPalette.tertiaryText)
+                                        .lineLimit(1)
+                                }
+                            }
                         }
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(result.accountLabel)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(LiquidPalette.primaryText)
-                            .lineLimit(1)
+                        Spacer(minLength: 8)
 
-                        Text(summarySubtitle(for: result))
-                            .font(.caption)
-                            .foregroundStyle(LiquidPalette.secondaryText)
-                            .lineLimit(isExpanded ? 3 : 1)
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Text("\(result.elapsedMs) ms")
+                                .font(.system(.caption2, design: .monospaced).weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(LiquidPalette.secondaryText)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
+
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(LiquidPalette.tertiaryText)
+                                .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                        }
                     }
 
-                    Spacer(minLength: 8)
+                    Text(result.diagnosticReason)
+                        .font(.footnote)
+                        .foregroundStyle(isFailureLike ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
+                        .lineLimit(isExpanded ? nil : 3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                    VStack(alignment: .trailing, spacing: 6) {
-                        Text("\(result.elapsedMs) ms")
-                            .font(.system(.caption2, design: .monospaced).weight(.medium))
-                            .monospacedDigit()
-                            .foregroundStyle(LiquidPalette.secondaryText)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
-
-                        Image(systemName: "chevron.down")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(LiquidPalette.tertiaryText)
-                            .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                    }
+                    resultDiagnosticChips(for: result)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 14)
@@ -252,90 +274,274 @@ struct RecordsView: View {
         )
         .overlay {
             RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusCard, style: .continuous)
-                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 1)
+                .strokeBorder(
+                    isFailureLike
+                        ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                        : LiquidPalette.hairline(colorScheme),
+                    lineWidth: 1
+                )
                 .allowsHitTesting(false)
         }
     }
 
-    private func summarySubtitle(for result: SignResult) -> String {
-        let trimmed = result.message.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || trimmed == result.state.displayTitle {
-            return result.state.displayTitle
+    @ViewBuilder
+    private func resultDiagnosticChips(for result: SignResult) -> some View {
+        let strategy = result.strategyId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasStrategy = !(strategy?.isEmpty ?? true)
+        let httpStatus = result.effectiveHttpStatus
+        let businessCode = result.effectiveBusinessCode
+
+        if httpStatus != nil || businessCode != nil || hasStrategy {
+            HStack(spacing: 6) {
+                if let httpStatus {
+                    diagnosticMetaChip(
+                        httpStatus > 0 ? "HTTP \(httpStatus)" : "网络错误",
+                        warning: httpStatus < 0 || httpStatus >= 400
+                    )
+                }
+
+                if let businessCode {
+                    diagnosticMetaChip("code \(businessCode)", warning: businessCode != 0)
+                }
+
+                if let strategy, !strategy.isEmpty {
+                    Text(strategy)
+                        .font(.system(.caption2, design: .monospaced).weight(.medium))
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
+                        .overlay {
+                            Capsule()
+                                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.6)
+                                .allowsHitTesting(false)
+                        }
+                }
+
+                Spacer(minLength: 0)
+            }
         }
-        return "\(result.state.displayTitle) · \(trimmed)"
     }
 
     private func attemptTraceSection(_ result: SignResult) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !result.host.isEmpty {
-                HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                if !result.host.isEmpty {
                     Text("\(LiquidPalette.editionDisplayName(forHost: result.host)) · \(result.host)")
                         .font(.caption2)
                         .foregroundStyle(LiquidPalette.tertiaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer(minLength: 8)
+                } else {
+                    Text(result.state.displayTitle)
+                        .font(.caption2)
+                        .foregroundStyle(LiquidPalette.tertiaryText)
                 }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    copyDiagnosticReport(for: result)
+                } label: {
+                    Label("复制诊断", systemImage: "doc.on.doc")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(LiquidPalette.accent)
+                        .lineLimit(1)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 5)
+                        .background(
+                            LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                            in: Capsule()
+                        )
+                        .overlay {
+                            Capsule()
+                                .strokeBorder(
+                                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                    lineWidth: 0.75
+                                )
+                                .allowsHitTesting(false)
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
             }
 
             if result.attempts.isEmpty {
-                Text("无网络请求链路（\(result.state.displayTitle)）")
+                Text("无网络请求链路（\(result.diagnosticReason)）")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(LiquidPalette.tertiaryText)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
-                ForEach(Array(result.attempts.enumerated()), id: \.offset) { _, attempt in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("\(attempt.strategyId) · \(attempt.method)")
-                                .font(.system(.caption, design: .monospaced).weight(.semibold))
-                                .foregroundStyle(LiquidPalette.primaryText)
-
-                            Spacer(minLength: 6)
-
-                            Text(attemptMetaText(attempt))
-                                .font(.system(.caption2, design: .monospaced))
-                                .monospacedDigit()
-                                .foregroundStyle(LiquidPalette.secondaryText)
-                        }
-
-                        if !attempt.message.isEmpty {
-                            Text(attempt.message)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(LiquidPalette.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        Text(attempt.url)
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(LiquidPalette.tertiaryText)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        LiquidPalette.subtleSurface(colorScheme),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
-                            .allowsHitTesting(false)
-                    }
+                ForEach(Array(result.attempts.enumerated()), id: \.offset) { index, attempt in
+                    attemptTraceCard(attempt, index: index)
                 }
             }
         }
     }
 
-    private func attemptMetaText(_ attempt: AttemptTrace) -> String {
-        var parts: [String] = []
-        if let httpStatus = attempt.httpStatus {
-            parts.append("HTTP \(httpStatus)")
+    private func attemptTraceCard(_ attempt: AttemptTrace, index: Int) -> some View {
+        let trimmedMessage = attempt.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUrl = attempt.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedFinalUrl = attempt.finalUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSnippet = attempt.rawSnippet?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("#\(index + 1) \(attempt.strategyId) · \(attempt.method)")
+                    .font(.system(.caption, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+
+                Spacer(minLength: 6)
+
+                Text("\(attempt.elapsedMs) ms")
+                    .font(.system(.caption2, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(LiquidPalette.tertiaryText)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            if attempt.httpStatus != nil || attempt.businessCode != nil {
+                HStack(spacing: 6) {
+                    if let httpStatus = attempt.httpStatus {
+                        diagnosticMetaChip(
+                            httpStatus > 0 ? "HTTP \(httpStatus)" : "网络错误",
+                            warning: httpStatus < 0 || httpStatus >= 400
+                        )
+                    }
+                    if let businessCode = attempt.businessCode {
+                        diagnosticMetaChip("code \(businessCode)", warning: businessCode != 0)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+
+            if !trimmedMessage.isEmpty {
+                Text(trimmedMessage)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
+            Text(trimmedUrl)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(LiquidPalette.tertiaryText)
+                .lineLimit(2)
+                .truncationMode(.middle)
+
+            if let trimmedFinalUrl, !trimmedFinalUrl.isEmpty, trimmedFinalUrl != trimmedUrl {
+                Text("重定向 → \(trimmedFinalUrl)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(LiquidPalette.secondaryText)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            if let trimmedSnippet, !trimmedSnippet.isEmpty, trimmedSnippet != trimmedMessage {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("响应片段")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(LiquidPalette.tertiaryText)
+
+                    Text(trimmedSnippet)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    LiquidPalette.elevatedSurface(colorScheme),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
+                        .allowsHitTesting(false)
+                }
+            }
         }
-        if let code = attempt.businessCode {
-            parts.append("code \(code)")
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LiquidPalette.subtleSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
+                .allowsHitTesting(false)
         }
-        parts.append("\(attempt.elapsedMs) ms")
-        return parts.joined(separator: " · ")
+    }
+
+    private func diagnosticMetaChip(_ text: String, warning: Bool) -> some View {
+        Text(text)
+            .font(.system(.caption2, design: .monospaced).weight(.medium))
+            .monospacedDigit()
+            .foregroundStyle(warning ? Color.orange : LiquidPalette.secondaryText)
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                warning
+                    ? Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                    : LiquidPalette.subtleSurface(colorScheme),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule()
+                    .strokeBorder(
+                        warning
+                            ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                            : LiquidPalette.hairline(colorScheme),
+                        lineWidth: 0.6
+                    )
+                    .allowsHitTesting(false)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func statusForegroundColor(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent
+        }
+        if state.isFailureLike {
+            return Color.orange
+        }
+        return LiquidPalette.secondaryText
+    }
+
+    private func statusBadgeFill(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
+        }
+        if state.isFailureLike {
+            return Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)
+        }
+        return LiquidPalette.subtleSurface(colorScheme)
+    }
+
+    private func statusBadgeBorder(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20)
+        }
+        if state.isFailureLike {
+            return Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+        }
+        return LiquidPalette.hairline(colorScheme)
+    }
+
+    private func copyDiagnosticReport(for result: SignResult) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = result.diagnosticReportText
+        #endif
+        store.showToast(result.state.isFailureLike ? "已复制失败原因与诊断信息" : "已复制诊断信息")
     }
 }

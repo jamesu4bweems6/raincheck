@@ -62,8 +62,36 @@ enum QrCodeParser {
             || lowerPath.contains("scan-handler")
             || query["qrContent"] != nil
 
-        // 宽泛登录路径提示（优先级低于显式 lessonId / classroomId）
-        let isBroadLoginPath = spec.loginPathHints.contains { hint in
+        // 明确签到路径信号（如 /api/v3/lesson/check-in/dynamic-qr-code、/checkin、/check-in）
+        let isDynamicQrPath = lowerPath.contains("dynamic-qr")
+        let isCheckinPath = isDynamicQrPath
+            || lowerPath.contains("check-in")
+            || lowerPath.contains("checkin")
+            || lowerPath.contains("check_in")
+
+        let isRainClassroomHost: Bool = {
+            guard let host else { return false }
+            let hostOnly = normalizeHostPort(scheme: "https", rawHost: host)
+            return hostOnly == "yuketang.cn"
+                || isTrustedRainClassroomSubdomain(hostOnly)
+                || hostOnly == "ykt.io"
+                || hostOnly == "xuetangx.com"
+                || hostOnly.hasSuffix(".xuetangx.com")
+                || hostOnly == "yuketang"
+                || profile.editionForHost(host) != nil
+                || profile.qr.allowedUrlHosts.contains { $0.caseInsensitiveCompare(host) == .orderedSame }
+        }()
+
+        let hasAnyCheckinSignal = isCheckinPath
+            || lessonId != nil
+            || classroomId != nil
+            || checkinId != nil
+            || !(query["c"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            || !(query["t"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            || !(query["s"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        // 宽泛登录路径提示（优先级低于显式签到路径 / lessonId / classroomId / 动态码参数）
+        let isBroadLoginPath = !hasAnyCheckinSignal && spec.loginPathHints.contains { hint in
             let trimmed = hint.trimmingCharacters(in: .whitespacesAndNewlines)
             return !trimmed.isEmpty && lowerPath.contains(trimmed.lowercased())
         }
@@ -75,8 +103,12 @@ enum QrCodeParser {
             kind = .dynamicCheckin
         } else if isExplicitLogin {
             kind = .login
+        } else if isRainClassroomHost && isDynamicQrPath {
+            kind = .dynamicCheckin
         } else if lessonId != nil || classroomId != nil || isPureDigits {
             kind = .lessonOnly
+        } else if isRainClassroomHost && isCheckinPath && (!query.isEmpty || checkinId != nil) {
+            kind = .dynamicCheckin
         } else if isBroadLoginPath {
             kind = .login
         } else {
@@ -183,7 +215,8 @@ enum QrCodeParser {
 
         switch scheme {
         case "https":
-            return allowedHttps.contains(normalized) ? nil : "域名 \(hostPort) 不在白名单中"
+            let trusted = allowedHttps.contains(normalized) || isTrustedRainClassroomSubdomain(normalized)
+            return trusted ? nil : "域名 \(hostPort) 不在白名单中"
         case "http":
             return allowedHttp.contains(normalized) ? nil : "拒绝向未显式允许的明文 HTTP 主机 \(hostPort) 发送凭据"
         default:
@@ -199,6 +232,10 @@ enum QrCodeParser {
         }
         let normalizedHttps = normalizeHostPort(scheme: "https", rawHost: cleaned)
         let normalizedHttp = normalizeHostPort(scheme: "http", rawHost: cleaned)
+
+        if isTrustedRainClassroomSubdomain(normalizedHttps) {
+            return true
+        }
 
         for allowed in profile.qr.allowedUrlHosts {
             let trimmed = allowed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -219,6 +256,28 @@ enum QrCodeParser {
             }
         }
 
+        return false
+    }
+
+    /// 放行雨课堂官方校园多租户子域名（仅限标准 HTTPS 端口的 `*.yuketang.cn` 与 `*.ykt.io`）。
+    private static func isTrustedRainClassroomSubdomain(_ normalizedHttpsHost: String) -> Bool {
+        guard !normalizedHttpsHost.contains(":") else { return false }
+        let suffixes = [".yuketang.cn", ".ykt.io"]
+        for suffix in suffixes {
+            guard normalizedHttpsHost.hasSuffix(suffix) else { continue }
+            let prefix = String(normalizedHttpsHost.dropLast(suffix.count))
+            guard !prefix.isEmpty else { continue }
+            let labels = prefix.split(separator: ".", omittingEmptySubsequences: false)
+            let valid = !labels.isEmpty && labels.allSatisfy { label in
+                guard !label.isEmpty, !label.hasPrefix("-"), !label.hasSuffix("-") else {
+                    return false
+                }
+                return label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+            }
+            if valid {
+                return true
+            }
+        }
         return false
     }
 
@@ -248,10 +307,62 @@ enum QrCodeParser {
             let decodedKey = decodeFormUTF8(key)
             if !decodedKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                output[decodedKey] == nil {
-                output[decodedKey] = decodeFormUTF8(value)
+                output[decodedKey] = decodeQueryValue(value, forKey: decodedKey)
             }
         }
         return output
+    }
+
+    /// 查询参数值解码：对 `c` / `s` / `ticket` 中纯 ASCII Base64 样式令牌保留字面量 `+`，
+    /// 对普通表单参数与多字节中文混合值保持 `+` 转空格以完全兼容跨端测试向量。
+    static func decodeQueryValue(_ value: String, forKey key: String) -> String {
+        let lowerKey = key.lowercased()
+        let isTokenKey = (lowerKey == "c" || lowerKey == "s" || lowerKey == "ticket")
+        if isTokenKey && value.contains("+") && isAsciiBase64TokenCandidate(value) {
+            return decodePercentUTF8(value)
+        }
+        return decodeFormUTF8(value)
+    }
+
+    private static func isAsciiBase64TokenCandidate(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let v = scalar.value
+            return (v >= 0x30 && v <= 0x39) // 0-9
+                || (v >= 0x41 && v <= 0x5A) // A-Z
+                || (v >= 0x61 && v <= 0x7A) // a-z
+                || v == 0x2B // '+'
+                || v == 0x2F // '/'
+                || v == 0x3D // '='
+                || v == 0x2D // '-'
+                || v == 0x5F // '_'
+                || v == 0x25 // '%'
+        }
+    }
+
+    /// 仅解 `%XX` 百分号编码、保留字面量 `+` 的 UTF-8 安全解码。
+    static func decodePercentUTF8(_ value: String) -> String {
+        if !value.contains("%") {
+            return value
+        }
+        let scalars = Array(value.utf8)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(scalars.count)
+
+        var i = 0
+        while i < scalars.count {
+            let b = scalars[i]
+            if b == 0x25, i + 2 < scalars.count,
+               let hi = hexNibble(scalars[i + 1]),
+               let lo = hexNibble(scalars[i + 2]) {
+                bytes.append((hi << 4) | lo)
+                i += 3
+            } else {
+                bytes.append(b)
+                i += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// UTF-8 安全 URL 解码：`+` 转空格，`%XX` 字节拼接，正确保留多字节中文与字面量 Unicode。

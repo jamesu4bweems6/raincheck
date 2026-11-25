@@ -11,6 +11,7 @@ struct CheckInView: View {
     @State private var pendingManualPasteAfterScanner = false
     @State private var showManualInput = false
     @State private var manualInputText = ""
+    @State private var expandedResultIds: Set<String> = []
 
     private var enabledAccounts: [Account] {
         store.accounts.filter(\.enabled)
@@ -35,6 +36,16 @@ struct CheckInView: View {
 
     private var latestFailedCount: Int {
         store.results.filter { $0.state.isFailureLike }.count
+    }
+
+    private var latestFailedResults: [SignResult] {
+        store.results.filter { $0.state.isFailureLike }
+    }
+
+    private var orderedLatestResults: [SignResult] {
+        let failed = store.results.filter { $0.state.isFailureLike }
+        let others = store.results.filter { !$0.state.isFailureLike }
+        return failed + others
     }
 
     private var latestIsDryRunBatch: Bool {
@@ -280,10 +291,6 @@ struct CheckInView: View {
                     emphasized: ticket.kind == .dynamicCheckin
                 )
 
-                if ticket.kind == .dynamicCheckin, let issuedAt = ticket.issuedAtEpochSeconds {
-                    dynamicCountdownView(issuedAt: issuedAt)
-                }
-
                 Spacer(minLength: 8)
 
                 Button {
@@ -305,6 +312,14 @@ struct CheckInView: View {
                 .disabled(store.isCheckingIn)
                 .opacity(store.isCheckingIn ? 0.45 : 1.0)
                 .accessibilityLabel("清除当前二维码")
+            }
+
+            if ticket.kind == .dynamicCheckin {
+                if let issuedAt = ticket.issuedAtEpochSeconds {
+                    dynamicCountdownView(issuedAt: issuedAt)
+                } else {
+                    dynamicFreshnessHintView
+                }
             }
 
             Divider()
@@ -393,25 +408,95 @@ struct CheckInView: View {
     }
 
     private var latestResultSummaryStrip: some View {
-        HStack(alignment: .center, spacing: 10) {
+        VStack(alignment: .leading, spacing: 10) {
+            latestResultSummaryHeader
+
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(orderedLatestResults) { result in
+                    latestResultRow(result)
+                }
+            }
+        }
+    }
+
+    private var latestResultSummaryHeader: some View {
+        Group {
             if latestIsDryRunBatch {
-                Image(systemName: "testtube.2")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(LiquidPalette.accent)
-
-                Text("演练完成 · 已模拟 \(store.results.count) 个账号")
-                    .font(.footnote.weight(.semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(LiquidPalette.primaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.88)
-
-                Spacer(minLength: 0)
-            } else {
-                HStack(spacing: 8) {
-                    Image(systemName: latestFailedCount == 0 ? "checkmark.circle.fill" : "exclamationmark.circle")
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "testtube.2")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(latestFailedCount == 0 ? LiquidPalette.accent : LiquidPalette.primaryText)
+                        .foregroundStyle(LiquidPalette.accent)
+
+                    Text("演练完成 · 已模拟 \(store.results.count) 个账号")
+                        .font(.footnote.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(LiquidPalette.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+
+                    Spacer(minLength: 8)
+
+                    copyBatchDiagnosticsButton
+                }
+            } else if latestFailedCount > 0 {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .center, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.orange)
+
+                        Text("成功 \(latestSucceededCount) · 失败 \(latestFailedCount)")
+                            .font(.footnote.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(LiquidPalette.primaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.88)
+
+                        Spacer(minLength: 8)
+
+                        Text("共 \(store.results.count) 个账号")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(LiquidPalette.tertiaryText)
+                            .lineLimit(1)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button {
+                            store.retryFailed()
+                        } label: {
+                            Label("重试失败项", systemImage: "arrow.clockwise")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(LiquidPalette.accent)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.86)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .frame(maxWidth: .infinity, minHeight: 34)
+                                .background(
+                                    LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                                    in: Capsule()
+                                )
+                                .overlay {
+                                    Capsule()
+                                        .strokeBorder(
+                                            LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
+                                            lineWidth: 0.75
+                                        )
+                                        .allowsHitTesting(false)
+                                }
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        copyBatchDiagnosticsButton
+                    }
+                }
+            } else {
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(LiquidPalette.accent)
 
                     Text("成功 \(latestSucceededCount) · 失败 \(latestFailedCount)")
                         .font(.footnote.weight(.semibold))
@@ -419,38 +504,10 @@ struct CheckInView: View {
                         .foregroundStyle(LiquidPalette.primaryText)
                         .lineLimit(1)
                         .minimumScaleFactor(0.88)
-                }
 
-                Spacer(minLength: 8)
+                    Spacer(minLength: 8)
 
-                if latestFailedCount > 0 {
-                    Button {
-                        store.retryFailed()
-                    } label: {
-                        Text("重试失败项")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(LiquidPalette.accent)
-                            .lineLimit(1)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .frame(minWidth: 88, minHeight: 32)
-                            .background(
-                                LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10),
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule()
-                                    .strokeBorder(
-                                        LiquidPalette.accent.opacity(colorScheme == .dark ? 0.28 : 0.20),
-                                        lineWidth: 0.75
-                                    )
-                                    .allowsHitTesting(false)
-                            }
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .layoutPriority(1)
+                    copyBatchDiagnosticsButton
                 }
             }
         }
@@ -463,9 +520,397 @@ struct CheckInView: View {
         )
         .overlay {
             RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
-                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                .strokeBorder(
+                    latestFailedCount > 0 && !latestIsDryRunBatch
+                        ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                        : LiquidPalette.hairline(colorScheme),
+                    lineWidth: 0.75
+                )
                 .allowsHitTesting(false)
         }
+    }
+
+    private var copyBatchDiagnosticsButton: some View {
+        Button {
+            copyBatchDiagnostics()
+        } label: {
+            Label("复制诊断", systemImage: "doc.on.doc")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(LiquidPalette.primaryText)
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .frame(minWidth: 88, minHeight: 34)
+                .background(LiquidPalette.elevatedSurface(colorScheme), in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                        .allowsHitTesting(false)
+                }
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+    }
+
+    private func latestResultRow(_ result: SignResult) -> some View {
+        let isExpanded = expandedResultIds.contains(result.id)
+        let isFailure = result.state.isFailureLike
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: result.state.symbolName)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(statusForegroundColor(for: result.state))
+
+                        Text(result.accountLabel)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(LiquidPalette.primaryText)
+                            .lineLimit(1)
+                    }
+
+                    if !result.host.isEmpty {
+                        Text("\(LiquidPalette.editionDisplayName(forHost: result.host)) · \(result.host)")
+                            .font(.caption2)
+                            .foregroundStyle(LiquidPalette.tertiaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                Text(result.state.displayTitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusForegroundColor(for: result.state))
+                    .lineLimit(1)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(statusPillFill(for: result.state), in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .strokeBorder(statusPillBorder(for: result.state), lineWidth: 0.75)
+                            .allowsHitTesting(false)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+            }
+
+            Text(result.diagnosticReason)
+                .font(isFailure ? .footnote : .caption)
+                .foregroundStyle(isFailure ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+
+            resultMetaChips(for: result)
+
+            if !result.attempts.isEmpty || isFailure {
+                HStack(alignment: .center, spacing: 8) {
+                    if !result.attempts.isEmpty {
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                                toggleExpandedResult(result.id)
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                    .font(.caption2.weight(.semibold))
+                                Text(isExpanded ? "收起请求链路" : "查看请求链路（\(result.attempts.count)）")
+                                    .font(.caption.weight(.medium))
+                                    .monospacedDigit()
+                            }
+                            .foregroundStyle(LiquidPalette.accent)
+                            .padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if isFailure {
+                        Button {
+                            copySingleDiagnostic(result)
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(LiquidPalette.secondaryText)
+                                .lineLimit(1)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(LiquidPalette.elevatedSurface(colorScheme), in: Capsule())
+                                .overlay {
+                                    Capsule()
+                                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.6)
+                                        .allowsHitTesting(false)
+                                }
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
+            }
+
+            if isExpanded && !result.attempts.isEmpty {
+                Divider()
+                    .overlay(LiquidPalette.hairline(colorScheme))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(result.attempts.enumerated()), id: \.offset) { index, attempt in
+                        latestAttemptCard(attempt, index: index)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LiquidPalette.subtleSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: LiquidMetrics.cornerRadiusControl, style: .continuous)
+                .strokeBorder(
+                    isFailure
+                        ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                        : LiquidPalette.hairline(colorScheme),
+                    lineWidth: 0.75
+                )
+                .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private func resultMetaChips(for result: SignResult) -> some View {
+        let strategy = result.strategyId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasStrategy = !(strategy?.isEmpty ?? true)
+        let httpStatus = result.effectiveHttpStatus
+        let businessCode = result.effectiveBusinessCode
+        let hasPrimaryChips = httpStatus != nil || businessCode != nil || result.elapsedMs > 0
+
+        if hasPrimaryChips || hasStrategy {
+            VStack(alignment: .leading, spacing: 4) {
+                if hasPrimaryChips {
+                    HStack(spacing: 6) {
+                        if let httpStatus {
+                            diagnosticCodeChip(
+                                httpStatus > 0 ? "HTTP \(httpStatus)" : "网络错误",
+                                warning: httpStatus < 0 || httpStatus >= 400
+                            )
+                        }
+
+                        if let businessCode {
+                            diagnosticCodeChip(
+                                "code \(businessCode)",
+                                warning: businessCode != 0
+                            )
+                        }
+
+                        if result.elapsedMs > 0 {
+                            diagnosticCodeChip("\(result.elapsedMs) ms", warning: false)
+                        }
+
+                        Spacer(minLength: 0)
+                    }
+                }
+
+                if let strategy, !strategy.isEmpty {
+                    Text("策略：\(strategy)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(LiquidPalette.tertiaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+    }
+
+    private func latestAttemptCard(_ attempt: AttemptTrace, index: Int) -> some View {
+        let trimmedMessage = attempt.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUrl = attempt.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedFinalUrl = attempt.finalUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSnippet = attempt.rawSnippet?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("#\(index + 1) \(attempt.strategyId) · \(attempt.method)")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+
+                Spacer(minLength: 4)
+
+                Text("\(attempt.elapsedMs) ms")
+                    .font(.system(.caption2, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(LiquidPalette.tertiaryText)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            if attempt.httpStatus != nil || attempt.businessCode != nil {
+                HStack(spacing: 6) {
+                    if let httpStatus = attempt.httpStatus {
+                        diagnosticCodeChip(
+                            httpStatus > 0 ? "HTTP \(httpStatus)" : "网络错误",
+                            warning: httpStatus < 0 || httpStatus >= 400
+                        )
+                    }
+                    if let businessCode = attempt.businessCode {
+                        diagnosticCodeChip("code \(businessCode)", warning: businessCode != 0)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+
+            if !trimmedMessage.isEmpty {
+                Text(trimmedMessage)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(LiquidPalette.primaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
+            Text(trimmedUrl)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(LiquidPalette.tertiaryText)
+                .lineLimit(2)
+                .truncationMode(.middle)
+
+            if let trimmedFinalUrl, !trimmedFinalUrl.isEmpty, trimmedFinalUrl != trimmedUrl {
+                Text("重定向 → \(trimmedFinalUrl)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(LiquidPalette.secondaryText)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            if let trimmedSnippet, !trimmedSnippet.isEmpty, trimmedSnippet != trimmedMessage {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("响应片段")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(LiquidPalette.tertiaryText)
+
+                    Text(trimmedSnippet)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(LiquidPalette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    LiquidPalette.subtleSurface(colorScheme),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LiquidPalette.elevatedSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.5)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func diagnosticCodeChip(_ text: String, warning: Bool) -> some View {
+        Text(text)
+            .font(.system(.caption2, design: .monospaced).weight(.medium))
+            .monospacedDigit()
+            .foregroundStyle(warning ? Color.orange : LiquidPalette.secondaryText)
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                warning
+                    ? Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                    : LiquidPalette.elevatedSurface(colorScheme),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule()
+                    .strokeBorder(
+                        warning
+                            ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                            : LiquidPalette.hairline(colorScheme),
+                        lineWidth: 0.6
+                    )
+                    .allowsHitTesting(false)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func statusForegroundColor(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent
+        }
+        if state.isFailureLike {
+            return Color.orange
+        }
+        return LiquidPalette.secondaryText
+    }
+
+    private func statusPillFill(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent.opacity(colorScheme == .dark ? 0.16 : 0.10)
+        }
+        if state.isFailureLike {
+            return Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)
+        }
+        return LiquidPalette.elevatedSurface(colorScheme)
+    }
+
+    private func statusPillBorder(for state: SignState) -> Color {
+        if state.isSuccessLike {
+            return LiquidPalette.accent.opacity(colorScheme == .dark ? 0.30 : 0.22)
+        }
+        if state.isFailureLike {
+            return Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+        }
+        return LiquidPalette.hairline(colorScheme)
+    }
+
+    private func toggleExpandedResult(_ id: String) {
+        if expandedResultIds.contains(id) {
+            expandedResultIds.remove(id)
+        } else {
+            expandedResultIds.insert(id)
+        }
+    }
+
+    private func copyBatchDiagnostics() {
+        let failed = latestFailedResults
+        let targets = failed.isEmpty ? orderedLatestResults : failed
+        guard !targets.isEmpty else { return }
+        let report = targets
+            .map(\.diagnosticReportText)
+            .joined(separator: "\n\n---\n\n")
+        #if canImport(UIKit)
+        UIPasteboard.general.string = report
+        #endif
+        store.showToast("已复制失败原因与诊断信息")
+    }
+
+    private func copySingleDiagnostic(_ result: SignResult) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = result.diagnosticReportText
+        #endif
+        store.showToast("已复制失败原因与诊断信息")
     }
 
     private func ticketMetaRow(label: String, value: String, monospaced: Bool = false) -> some View {
@@ -486,22 +931,69 @@ struct CheckInView: View {
     private func dynamicCountdownView(issuedAt: TimeInterval) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             let elapsed = max(0, Int(context.date.timeIntervalSince1970 - issuedAt))
-            let defaultWindow = 30
-            let remaining = max(0, defaultWindow - elapsed)
-            let labelText = remaining > 0 ? "约剩 \(remaining)s" : "已生成 \(elapsed)s"
+            let isWarning = elapsed >= 8
+            let elapsedLabel = elapsed < 600 ? "\(elapsed)s" : "\(elapsed / 60) 分钟"
+            let labelText = "动态码已过去 \(elapsedLabel)（通常 8–15 秒刷新）"
 
-            Text(labelText)
-                .font(.system(.caption, design: .monospaced).weight(.semibold))
-                .monospacedDigit()
-                .foregroundStyle(remaining > 0 ? LiquidPalette.primaryText : LiquidPalette.secondaryText)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 6)
-                .background(LiquidPalette.subtleSurface(colorScheme), in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
-                        .allowsHitTesting(false)
-                }
+            HStack(spacing: 8) {
+                Image(systemName: isWarning ? "clock.badge.exclamationmark" : "clock")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(isWarning ? Color.orange : LiquidPalette.secondaryText)
+
+                Text(labelText)
+                    .font(.caption.weight(isWarning ? .semibold : .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(isWarning ? Color.orange : LiquidPalette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isWarning
+                    ? Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.10)
+                    : LiquidPalette.subtleSurface(colorScheme),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        isWarning
+                            ? Color.orange.opacity(colorScheme == .dark ? 0.34 : 0.24)
+                            : LiquidPalette.hairline(colorScheme),
+                        lineWidth: 0.75
+                    )
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var dynamicFreshnessHintView: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "clock")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(LiquidPalette.secondaryText)
+
+            Text("动态签到码通常 8–15 秒刷新，请尽快完成签到")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(LiquidPalette.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LiquidPalette.subtleSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(LiquidPalette.hairline(colorScheme), lineWidth: 0.75)
+                .allowsHitTesting(false)
         }
     }
 

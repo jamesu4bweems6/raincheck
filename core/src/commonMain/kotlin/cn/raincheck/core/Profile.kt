@@ -72,6 +72,7 @@ data class EndpointSpec(
     val query: Map<String, String> = emptyMap(),
     val auth: Boolean = true,
     val note: String = "",
+    val headers: Map<String, String> = emptyMap(),
 )
 
 @Serializable
@@ -98,13 +99,21 @@ data class QrSpec(
 @Serializable
 data class ResultSpec(
     val codeField: String = "code",
-    val altCodeKeys: List<String> = listOf("errcode"),
+    val altCodeKeys: List<String> = listOf("errcode", "error_code", "status_code"),
     val okCodes: List<Int> = listOf(0),
     val messageFields: List<String> = listOf("msg", "message"),
-    val altMessageKeys: List<String> = listOf("errmsg"),
+    val altMessageKeys: List<String> = listOf("errmsg", "errormsg", "detail", "error"),
     val alreadyKeywords: List<String> = listOf("已签到", "已经签到", "重复签到", "已参与"),
     val authKeywords: List<String> = listOf("登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"),
-    val expiredKeywords: List<String> = listOf("失效", "过期", "不存在", "二维码已"),
+    val expiredKeywords: List<String> = listOf(
+        "失效",
+        "过期",
+        "不存在",
+        "二维码已",
+        "dynamic qr check in refused",
+        "qr code expired",
+        "expired",
+    ),
     val retryHttpStatus: List<Int> = listOf(408, 425, 429, 500, 502, 503, 504),
 ) {
     fun allCodeKeys(): List<String> =
@@ -192,7 +201,11 @@ data class ProtocolProfile(
         }
 
         return when (scheme) {
-            "https" -> if (normalized in allowedHttps) null else "域名 $hostPort 不在白名单中"
+            "https" -> if (normalized in allowedHttps || isAllowedCampusHttpsSubdomain(normalized)) {
+                null
+            } else {
+                "域名 $hostPort 不在白名单中"
+            }
             "http" -> if (normalized in allowedHttp) null else "拒绝向未显式允许的明文 HTTP 主机 $hostPort 发送凭据"
             else -> "不允许的协议: $scheme"
         }
@@ -200,6 +213,20 @@ data class ProtocolProfile(
 
     fun isAllowedQrUrl(url: String, account: Account? = null): Boolean =
         validateQrUrl(url, account) == null
+
+    private fun isAllowedCampusHttpsSubdomain(normalizedHostPort: String): Boolean {
+        if (normalizedHostPort.contains(':') || normalizedHostPort.startsWith("[")) return false
+        val suffixes = listOf(".yuketang.cn", ".ykt.io")
+        val matchedSuffix = suffixes.firstOrNull { normalizedHostPort.endsWith(it) } ?: return false
+        val prefix = normalizedHostPort.removeSuffix(matchedSuffix)
+        if (prefix.isEmpty() || prefix.startsWith('.') || prefix.endsWith('.')) return false
+        return prefix.split('.').all { label ->
+            label.isNotEmpty() &&
+                !label.startsWith('-') &&
+                !label.endsWith('-') &&
+                label.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
+        }
+    }
 
     private fun normalizeHostPort(scheme: String, rawHost: String): String {
         val lower = rawHost.trim().lowercase()

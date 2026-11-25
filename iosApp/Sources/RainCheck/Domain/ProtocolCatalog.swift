@@ -282,6 +282,7 @@ struct EndpointSpec: Codable, Hashable, Sendable {
     let path: String
     let body: [String: TemplateValue]?
     let query: [String: String]
+    let headers: [String: String]
     let auth: Bool
     let note: String
 
@@ -290,6 +291,7 @@ struct EndpointSpec: Codable, Hashable, Sendable {
         path: String,
         body: [String: TemplateValue]? = nil,
         query: [String: String] = [:],
+        headers: [String: String] = [:],
         auth: Bool = true,
         note: String = ""
     ) {
@@ -297,6 +299,7 @@ struct EndpointSpec: Codable, Hashable, Sendable {
         self.path = path
         self.body = body
         self.query = query
+        self.headers = headers
         self.auth = auth
         self.note = note
     }
@@ -306,6 +309,7 @@ struct EndpointSpec: Codable, Hashable, Sendable {
         case path
         case body
         case query
+        case headers
         case auth
         case note
     }
@@ -316,6 +320,7 @@ struct EndpointSpec: Codable, Hashable, Sendable {
         self.path = try c.decode(String.self, forKey: .path)
         self.body = try c.decodeIfPresent([String: TemplateValue].self, forKey: .body)
         self.query = try c.decodeIfPresent([String: String].self, forKey: .query) ?? [:]
+        self.headers = try c.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
         self.auth = try c.decodeIfPresent(Bool.self, forKey: .auth) ?? true
         self.note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
     }
@@ -427,13 +432,13 @@ struct ResultSpec: Codable, Hashable, Sendable {
 
     init(
         codeField: String = "code",
-        altCodeKeys: [String] = ["errcode"],
+        altCodeKeys: [String] = ["errcode", "error_code", "status_code"],
         okCodes: [Int] = [0],
         messageFields: [String] = ["msg", "message"],
-        altMessageKeys: [String] = ["errmsg"],
+        altMessageKeys: [String] = ["errmsg", "errormsg", "detail", "error"],
         alreadyKeywords: [String] = ["已签到", "已经签到", "重复签到", "已参与"],
         authKeywords: [String] = ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"],
-        expiredKeywords: [String] = ["失效", "过期", "不存在", "二维码已"],
+        expiredKeywords: [String] = ["失效", "过期", "不存在", "二维码已", "dynamic qr check in refused", "qr code expired", "expired"],
         retryHttpStatus: [Int] = [408, 425, 429, 500, 502, 503, 504]
     ) {
         self.codeField = codeField
@@ -462,13 +467,13 @@ struct ResultSpec: Codable, Hashable, Sendable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.codeField = try c.decodeIfPresent(String.self, forKey: .codeField) ?? "code"
-        self.altCodeKeys = try c.decodeIfPresent([String].self, forKey: .altCodeKeys) ?? ["errcode"]
+        self.altCodeKeys = try c.decodeIfPresent([String].self, forKey: .altCodeKeys) ?? ["errcode", "error_code", "status_code"]
         self.okCodes = try c.decodeIfPresent([Int].self, forKey: .okCodes) ?? [0]
         self.messageFields = try c.decodeIfPresent([String].self, forKey: .messageFields) ?? ["msg", "message"]
-        self.altMessageKeys = try c.decodeIfPresent([String].self, forKey: .altMessageKeys) ?? ["errmsg"]
+        self.altMessageKeys = try c.decodeIfPresent([String].self, forKey: .altMessageKeys) ?? ["errmsg", "errormsg", "detail", "error"]
         self.alreadyKeywords = try c.decodeIfPresent([String].self, forKey: .alreadyKeywords) ?? ["已签到", "已经签到", "重复签到", "已参与"]
         self.authKeywords = try c.decodeIfPresent([String].self, forKey: .authKeywords) ?? ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"]
-        self.expiredKeywords = try c.decodeIfPresent([String].self, forKey: .expiredKeywords) ?? ["失效", "过期", "不存在", "二维码已"]
+        self.expiredKeywords = try c.decodeIfPresent([String].self, forKey: .expiredKeywords) ?? ["失效", "过期", "不存在", "二维码已", "dynamic qr check in refused", "qr code expired", "expired"]
         self.retryHttpStatus = try c.decodeIfPresent([Int].self, forKey: .retryHttpStatus) ?? [408, 425, 429, 500, 502, 503, 504]
     }
 
@@ -719,6 +724,26 @@ enum ProtocolCatalog {
                 auth: true,
                 note: "IPA 实证查询参数名为 lesson_id"
             ),
+            "appScan": EndpointSpec(
+                method: "POST",
+                path: "/api/v3/app/scan",
+                body: ["url": .string("{qrRaw}")],
+                headers: ["x-client": "app"],
+                auth: true,
+                note: "IPA 1.3.6 ARM64 实证：官方扫码第一步，提交原始二维码字符串由服务端校验动态签名并返回 data.type/data.value"
+            ),
+            "checkinAppScan": EndpointSpec(
+                method: "POST",
+                path: "/api/v3/lesson/checkin",
+                body: [
+                    "source": .int(21),
+                    "lessonId": .string("{lessonId}"),
+                    "joinIfNotIn": .bool(true)
+                ],
+                headers: ["x-client": "app"],
+                auth: true,
+                note: "IPA 1.3.6 ARM64 实证：HmsScanPage._postLessonCheckin 第二步，携带 source=21 与 joinIfNotIn=true"
+            ),
             "checkinTicket": EndpointSpec(
                 method: "POST",
                 path: "/api/v3/lesson/checkin",
@@ -849,13 +874,13 @@ enum ProtocolCatalog {
         ),
         result: ResultSpec(
             codeField: "code",
-            altCodeKeys: ["errcode"],
+            altCodeKeys: ["errcode", "error_code", "status_code"],
             okCodes: [0],
             messageFields: ["msg", "message"],
-            altMessageKeys: ["errmsg"],
+            altMessageKeys: ["errmsg", "errormsg", "detail", "error"],
             alreadyKeywords: ["已签到", "已经签到", "重复签到", "已参与"],
             authKeywords: ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"],
-            expiredKeywords: ["失效", "过期", "不存在", "二维码已"],
+            expiredKeywords: ["失效", "过期", "不存在", "二维码已", "dynamic qr check in refused", "qr code expired", "expired"],
             retryHttpStatus: [408, 425, 429, 500, 502, 503, 504]
         )
     )

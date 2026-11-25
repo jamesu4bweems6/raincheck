@@ -109,6 +109,22 @@
       "auth": true,
       "note": "IPA 实证查询参数名为 lesson_id"
     },
+    "appScan": {
+      "method": "POST",
+      "path": "/api/v3/app/scan",
+      "body": { "url": "{qrRaw}" },
+      "headers": { "x-client": "app" },
+      "auth": true,
+      "note": "IPA 1.3.6 ARM64 实证：官方扫码第一步，提交原始二维码字符串由服务端校验动态签名并返回 data.type/data.value"
+    },
+    "checkinAppScan": {
+      "method": "POST",
+      "path": "/api/v3/lesson/checkin",
+      "body": { "source": 21, "lessonId": "{lessonId}", "joinIfNotIn": true },
+      "headers": { "x-client": "app" },
+      "auth": true,
+      "note": "IPA 1.3.6 ARM64 实证：HmsScanPage._postLessonCheckin 第二步，携带 source=21 与 joinIfNotIn=true"
+    },
     "checkinTicket": {
       "method": "POST",
       "path": "/api/v3/lesson/checkin",
@@ -239,13 +255,13 @@
   },
   "result": {
     "codeField": "code",
-    "altCodeKeys": ["errcode"],
+    "altCodeKeys": ["errcode", "error_code", "status_code"],
     "okCodes": [0],
     "messageFields": ["msg", "message"],
-    "altMessageKeys": ["errmsg"],
+    "altMessageKeys": ["errmsg", "errormsg", "detail", "error"],
     "alreadyKeywords": ["已签到", "已经签到", "重复签到", "已参与"],
     "authKeywords": ["登录", "登陆", "未授权", "身份", "token", "会话", "unauthorized", "unauthenticated"],
-    "expiredKeywords": ["失效", "过期", "不存在", "二维码已"],
+    "expiredKeywords": ["失效", "过期", "不存在", "二维码已", "dynamic qr check in refused", "qr code expired", "expired"],
     "retryHttpStatus": [408, 425, 429, 500, 502, 503, 504]
   }
 }

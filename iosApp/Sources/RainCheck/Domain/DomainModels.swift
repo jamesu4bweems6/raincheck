@@ -364,6 +364,8 @@ struct AttemptTrace: Codable, Hashable, Sendable, Identifiable {
     let businessCode: Int?
     let message: String
     let elapsedMs: Int64
+    let rawSnippet: String?
+    let finalUrl: String?
 
     init(
         strategyId: String,
@@ -372,7 +374,9 @@ struct AttemptTrace: Codable, Hashable, Sendable, Identifiable {
         httpStatus: Int? = nil,
         businessCode: Int? = nil,
         message: String,
-        elapsedMs: Int64 = 0
+        elapsedMs: Int64 = 0,
+        rawSnippet: String? = nil,
+        finalUrl: String? = nil
     ) {
         self.strategyId = strategyId
         self.method = method
@@ -381,6 +385,8 @@ struct AttemptTrace: Codable, Hashable, Sendable, Identifiable {
         self.businessCode = businessCode
         self.message = message
         self.elapsedMs = elapsedMs
+        self.rawSnippet = rawSnippet
+        self.finalUrl = finalUrl
     }
 
     var id: String {
@@ -397,6 +403,7 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
     let state: SignState
     let strategyId: String?
     let httpStatus: Int?
+    let businessCode: Int?
     let message: String
     let elapsedMs: Int64
     let attempts: [AttemptTrace]
@@ -414,6 +421,7 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
         case state
         case strategyId
         case httpStatus
+        case businessCode
         case message
         case elapsedMs
         case attempts
@@ -427,6 +435,7 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
         state: SignState,
         strategyId: String? = nil,
         httpStatus: Int? = nil,
+        businessCode: Int? = nil,
         message: String,
         elapsedMs: Int64 = 0,
         attempts: [AttemptTrace] = [],
@@ -439,6 +448,7 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
         self.state = state
         self.strategyId = strategyId
         self.httpStatus = httpStatus
+        self.businessCode = businessCode
         self.message = message
         self.elapsedMs = elapsedMs
         self.attempts = attempts
@@ -454,6 +464,7 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
         self.state = try container.decode(SignState.self, forKey: .state)
         self.strategyId = try container.decodeIfPresent(String.self, forKey: .strategyId)
         self.httpStatus = try container.decodeIfPresent(Int.self, forKey: .httpStatus)
+        self.businessCode = try container.decodeIfPresent(Int.self, forKey: .businessCode)
         self.message = try container.decode(String.self, forKey: .message)
         self.elapsedMs = try container.decode(Int64.self, forKey: .elapsedMs)
         self.attempts = try container.decodeIfPresent([AttemptTrace].self, forKey: .attempts) ?? []
@@ -469,10 +480,158 @@ struct SignResult: Codable, Hashable, Sendable, Identifiable {
         try container.encode(state, forKey: .state)
         try container.encodeIfPresent(strategyId, forKey: .strategyId)
         try container.encodeIfPresent(httpStatus, forKey: .httpStatus)
+        try container.encodeIfPresent(businessCode, forKey: .businessCode)
         try container.encode(message, forKey: .message)
         try container.encode(elapsedMs, forKey: .elapsedMs)
         try container.encode(attempts, forKey: .attempts)
         try container.encode(timestampMs, forKey: .timestampMs)
+    }
+
+    var effectiveHttpStatus: Int? {
+        if let httpStatus {
+            return httpStatus
+        }
+        if let sid = strategyId,
+           let matched = attempts.last(where: { $0.strategyId == sid && $0.httpStatus != nil })?.httpStatus {
+            return matched
+        }
+        return attempts.last(where: { $0.httpStatus != nil })?.httpStatus
+    }
+
+    var effectiveBusinessCode: Int? {
+        if let businessCode {
+            return businessCode
+        }
+        if let sid = strategyId,
+           let matched = attempts.last(where: { $0.strategyId == sid && $0.businessCode != nil })?.businessCode {
+            return matched
+        }
+        return attempts.last(where: { $0.businessCode != nil })?.businessCode
+    }
+
+    /// 始终非空的可读诊断原因（失败时附带 HTTP 状态码、业务码与命中策略，杜绝空白或裸“签到失败”）。
+    var diagnosticReason: String {
+        let trimmedMsg = message.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let attemptFallback: String? = {
+            if let sid = strategyId,
+               let matched = attempts.last(where: {
+                   $0.strategyId == sid && !$0.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+               }) {
+                return matched.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let anyMsg = attempts.last(where: {
+                !$0.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }) {
+                return anyMsg.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let anySnippet = attempts.last(where: {
+                !($0.rawSnippet?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            })?.rawSnippet {
+                return anySnippet.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return nil
+        }()
+
+        let coreReason: String
+        if !trimmedMsg.isEmpty && trimmedMsg != state.displayTitle {
+            coreReason = trimmedMsg
+        } else if let attemptFallback, !attemptFallback.isEmpty, attemptFallback != state.displayTitle {
+            coreReason = attemptFallback
+        } else if !trimmedMsg.isEmpty {
+            coreReason = trimmedMsg
+        } else {
+            coreReason = state.displayTitle
+        }
+
+        guard state.isFailureLike else {
+            return coreReason
+        }
+
+        var metaParts: [String] = []
+        if let status = effectiveHttpStatus {
+            if status == -1 {
+                if !coreReason.contains("网络")
+                    && !coreReason.lowercased().contains("network")
+                    && !coreReason.contains("超时") {
+                    metaParts.append("网络异常")
+                }
+            } else if !coreReason.contains("HTTP \(status)") {
+                metaParts.append("HTTP \(status)")
+            }
+        }
+        if let code = effectiveBusinessCode {
+            if !coreReason.contains("\(code)") {
+                metaParts.append("code \(code)")
+            }
+        }
+        if let sid = strategyId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sid.isEmpty,
+           !coreReason.contains(sid) {
+            metaParts.append(sid)
+        }
+
+        if metaParts.isEmpty {
+            return coreReason
+        }
+        return "\(coreReason) [\(metaParts.joined(separator: " · "))]"
+    }
+
+    /// 脱敏多行诊断文本（供一键复制排查，严格不含任何凭据或 Cookie）。
+    var diagnosticReportText: String {
+        var lines: [String] = []
+        lines.append("RainCheck 签到诊断（已脱敏）")
+        lines.append("账号: \(accountLabel) (\(host))")
+        lines.append("状态: \(state.displayTitle) (\(state.rawValue))")
+        let safeReason = CredentialSanitizer.sanitizeDiagnosticSnippet(diagnosticReason, maxLength: 320) ?? state.displayTitle
+        lines.append("原因: \(safeReason)")
+
+        var summaryMeta: [String] = ["耗时: \(elapsedMs) ms"]
+        if let strategyId, !strategyId.isEmpty {
+            summaryMeta.append("策略: \(strategyId)")
+        }
+        if let status = effectiveHttpStatus {
+            summaryMeta.append("HTTP: \(status)")
+        }
+        if let code = effectiveBusinessCode {
+            summaryMeta.append("业务码: \(code)")
+        }
+        lines.append(summaryMeta.joined(separator: " | "))
+
+        if attempts.isEmpty {
+            lines.append("请求链路: 无网络请求")
+        } else {
+            lines.append("请求链路 (\(attempts.count)):")
+            for (index, attempt) in attempts.enumerated() {
+                var meta: [String] = []
+                if let status = attempt.httpStatus {
+                    meta.append("HTTP \(status)")
+                }
+                if let code = attempt.businessCode {
+                    meta.append("code \(code)")
+                }
+                meta.append("\(attempt.elapsedMs) ms")
+
+                let safeUrl = CredentialSanitizer.sanitizeDiagnosticURL(attempt.url)
+                lines.append("\(index + 1). [\(attempt.strategyId)] \(attempt.method) \(safeUrl) (\(meta.joined(separator: ", ")))")
+
+                let safeMsg = CredentialSanitizer.sanitizeDiagnosticSnippet(attempt.message, maxLength: 240)
+                if let safeMsg, !safeMsg.isEmpty {
+                    lines.append("   消息: \(safeMsg)")
+                }
+                if let finalUrl = attempt.finalUrl, !finalUrl.isEmpty, finalUrl != attempt.url {
+                    lines.append("   跳转: \(CredentialSanitizer.sanitizeDiagnosticURL(finalUrl))")
+                }
+                if let snippet = attempt.rawSnippet,
+                   let safeSnippet = CredentialSanitizer.sanitizeDiagnosticSnippet(snippet, maxLength: 200),
+                   !safeSnippet.isEmpty,
+                   safeSnippet != safeMsg {
+                    lines.append("   片段: \(safeSnippet)")
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -750,6 +909,53 @@ enum CredentialSanitizer {
             .trimmingCharacters(in: quoteAndSpaceSet)
             .lowercased()
         return (cleanedHost, detectedScheme)
+    }
+
+    /// 脱敏诊断文本片段：折叠空白、替换潜在凭据与 Cookie 值、并限制最大字符数。
+    static func sanitizeDiagnosticSnippet(_ raw: String, maxLength: Int = 200) -> String? {
+        let collapsed = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+
+        var sanitized = collapsed
+        let patterns: [(String, String)] = [
+            (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer [REDACTED]"),
+            (#"(?i)\b(sessionid|sid|csrftoken|csrf_token|set-auth|authorization|cookie)\s*[:=]\s*[^;\s,"'}\]]+"#, "$1=[REDACTED]"),
+            (#"(?i)"(bearer|sessionId|sessionid|csrfToken|csrftoken|lessonToken|access_token|refresh_token)"\s*:\s*"[^"]*""#, "\"$1\":\"[REDACTED]\"")
+        ]
+        for (pattern, replacement) in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let range = NSRange(sanitized.startIndex..<sanitized.endIndex, in: sanitized)
+                sanitized = regex.stringByReplacingMatches(in: sanitized, options: [], range: range, withTemplate: replacement)
+            }
+        }
+
+        let trimmed = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let safeMax = max(16, maxLength)
+        if trimmed.count <= safeMax {
+            return trimmed
+        }
+        return String(trimmed.prefix(safeMax - 1)) + "…"
+    }
+
+    /// 脱敏 URL 中的敏感查询参数（如 `token` / `sessionid` / `csrftoken` / `auth`），保留常规排障路径与参数。
+    static func sanitizeDiagnosticURL(_ rawURL: String) -> String {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        var sanitized = trimmed
+        let pattern = #"(?i)([?&])(token|sessionid|sid|csrftoken|csrf_token|authorization|auth|cookie)=([^&#]*)"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+            let range = NSRange(sanitized.startIndex..<sanitized.endIndex, in: sanitized)
+            sanitized = regex.stringByReplacingMatches(in: sanitized, options: [], range: range, withTemplate: "$1$2=[REDACTED]")
+        }
+        return sanitized
     }
 }
 

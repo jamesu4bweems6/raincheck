@@ -162,14 +162,27 @@ final class QrCodeParserTests: XCTestCase {
         XCTAssertEqual(profile.endpoint("locationUpdateSession")?.path, "/api/v3/location-checkin/update-session")
         XCTAssertTrue(profile.qr.schemes.contains("app"))
         XCTAssertTrue(profile.result.altCodeKeys.contains("errcode"))
+        XCTAssertTrue(profile.result.altCodeKeys.contains("error_code"))
+        XCTAssertTrue(profile.result.altCodeKeys.contains("status_code"))
         XCTAssertTrue(profile.result.altMessageKeys.contains("errmsg"))
+        XCTAssertTrue(profile.result.altMessageKeys.contains("errormsg"))
         XCTAssertFalse(profile.result.alreadyKeywords.contains("签到成功"))
+        XCTAssertEqual(profile.endpoint("appScan")?.method, "POST")
+        XCTAssertEqual(profile.endpoint("appScan")?.path, "/api/v3/app/scan")
+        XCTAssertEqual(profile.endpoint("appScan")?.headers["x-client"], "app")
+        XCTAssertEqual(profile.endpoint("checkinAppScan")?.method, "POST")
+        XCTAssertEqual(profile.endpoint("checkinAppScan")?.path, "/api/v3/lesson/checkin")
+        XCTAssertEqual(profile.endpoint("checkinAppScan")?.headers["x-client"], "app")
 
-        // 验证内置 fallback 与主 profile 策略链及站点一致
+        // 验证内置 fallback 与主 profile 完整一致（站点、端点、策略链、解析规则）
         let fallback = ProtocolCatalog.fallback
         XCTAssertEqual(fallback.editions.map(\.id), profile.editions.map(\.id))
+        XCTAssertEqual(Set(fallback.endpoints.keys), Set(profile.endpoints.keys))
+        XCTAssertEqual(fallback.endpoint("appScan"), profile.endpoint("appScan"))
+        XCTAssertEqual(fallback.endpoint("checkinAppScan"), profile.endpoint("checkinAppScan"))
         XCTAssertEqual(fallback.strategies.map(\.id), profile.strategies.map(\.id))
         XCTAssertEqual(fallback.qr.allowedUrlHosts, profile.qr.allowedUrlHosts)
+        XCTAssertEqual(fallback.result, profile.result)
     }
 
     // MARK: - validateQrUrl Security Guard
@@ -286,5 +299,87 @@ final class QrCodeParserTests: XCTestCase {
             XCTFail("coords[0] 必须保留 double 数值类型")
         }
         XCTAssertEqual(rendered["nested"]?.arrayValue?.first?.objectValue?["label"]?.stringValue, "prefix-ok")
+    }
+
+    func testCampusSubdomainAllowlistDynamicQrPathAndBase64PlusPreservation() throws {
+        let profile = try loadMasterProfile()
+        let prodAccount = Account(id: "a1", label: "学生", host: "www.yuketang.cn", scheme: "https", bearer: "tok")
+
+        // 校园子域名 *.yuketang.cn / *.ykt.io（仅标准 HTTPS 放行，禁止 HTTP 降级、非 443 端口与伪造后缀）
+        XCTAssertTrue(
+            QrCodeParser.validateQrUrl(
+                "https://sub.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=1&t=2&s=3",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+        XCTAssertTrue(
+            QrCodeParser.validateQrUrl(
+                "https://campus.ykt.io/api/v3/lesson/checkin?c=1",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+        XCTAssertTrue(QrCodeParser.isHostAllowlisted("sub.yuketang.cn", profile: profile))
+        XCTAssertTrue(QrCodeParser.isHostAllowlisted("campus.ykt.io", profile: profile))
+        XCTAssertFalse(
+            QrCodeParser.validateQrUrl(
+                "http://sub.yuketang.cn/api/v3/lesson/checkin?c=1",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+        XCTAssertFalse(
+            QrCodeParser.validateQrUrl(
+                "https://sub.yuketang.cn:8443/api/v3/lesson/checkin?c=1",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+        XCTAssertFalse(
+            QrCodeParser.validateQrUrl(
+                "https://evilyuketang.cn/api/v3/lesson/checkin?c=1",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+        XCTAssertFalse(
+            QrCodeParser.validateQrUrl(
+                "https://evil.example/api/v3/lesson/check-in/dynamic-qr-code?c=1",
+                account: prodAccount,
+                profile: profile
+            )
+        )
+
+        // 真实 dynamic-qr-code 路径与 Base64 字面量 '+' 保留
+        let base64Ticket = QrCodeParser.parse(
+            "https://sub.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=AbC+123/4==&t=1763900000&s=XyZ+987=",
+            profile: profile
+        )
+        XCTAssertEqual(base64Ticket.kind, .dynamicCheckin)
+        XCTAssertEqual(base64Ticket.host, "sub.yuketang.cn")
+        XCTAssertEqual(base64Ticket.dynamicCode, "AbC+123/4==")
+        XCTAssertEqual(base64Ticket.signature, "XyZ+987=")
+
+        // 非 c/t/s 参数的 dynamic-qr-code 路径在雨课堂域名下也识别为 .dynamicCheckin
+        let variantDyn = QrCodeParser.parse(
+            "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=opaque123",
+            profile: profile
+        )
+        XCTAssertEqual(variantDyn.kind, .dynamicCheckin)
+
+        // 含 qrcode / scan 的签到路径绝不被 loginPathHints 误判为 .login
+        let qrCheckIn = QrCodeParser.parse(
+            "https://www.yuketang.cn/v/index/qrcode/check-in?code=xyz",
+            profile: profile
+        )
+        XCTAssertEqual(qrCheckIn.kind, .dynamicCheckin)
+
+        let scanCheckIn = QrCodeParser.parse(
+            "https://www.yuketang.cn/v/index/scan/checkin?lessonId=12345",
+            profile: profile
+        )
+        XCTAssertEqual(scanCheckIn.kind, .lessonOnly)
+        XCTAssertEqual(scanCheckIn.lessonId, "12345")
     }
 }

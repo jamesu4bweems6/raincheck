@@ -547,9 +547,18 @@ final class CheckInOrchestratorTests: XCTestCase {
         let originalToken = "STORE_ORIG_SECRET_TOKEN_111"
         let rotatedToken = "STORE_ROTATED_SECRET_TOKEN_222"
         let networkCalls = LockedBox(0)
+        let checkinCalls = LockedBox(0)
 
-        let session = MockNetworkSupport.makeSession { _ in
+        let session = MockNetworkSupport.makeSession { request in
             networkCalls.withLock { $0 += 1 }
+            let path = request.url?.path ?? ""
+            if path == "/api/v3/app/scan" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"OK","data":{"type":"checkin","value":"1529274209982060032"}}"#
+                )
+            }
+            checkinCalls.withLock { $0 += 1 }
             return .json(
                 200,
                 #"{"code":0,"msg":"签到成功"}"#,
@@ -591,9 +600,11 @@ final class CheckInOrchestratorTests: XCTestCase {
         }
 
         XCTAssertFalse(store.isCheckingIn)
-        XCTAssertEqual(networkCalls.get(), 1)
+        XCTAssertEqual(networkCalls.get(), 2, "官方两步扫码应执行 app/scan + lesson/checkin")
+        XCTAssertEqual(checkinCalls.get(), 1)
         XCTAssertEqual(store.results.count, 1)
         XCTAssertEqual(store.results.first?.state, SignState.success)
+        XCTAssertEqual(store.results.first?.strategyId, "APP_SCAN_CHECKIN")
         XCTAssertEqual(store.accounts.first?.bearer, rotatedToken, "轮换后的新凭据应安全回填到账号池")
         XCTAssertEqual(vault.load().first?.bearer, rotatedToken, "轮换后的新凭据应同步持久化到 Vault")
 
@@ -1151,10 +1162,15 @@ final class CheckInOrchestratorTests: XCTestCase {
         let profile = try TestBundleResources.loadProtocolProfile()
         let vault = InMemoryAccountVault()
         let seenAuths = LockedBox<[String]>([])
+        let seenCheckInAuths = LockedBox<[String]>([])
 
         let session = MockNetworkSupport.makeSession { request in
             let auth = MockNetworkSupport.headerValue("Authorization", in: request) ?? ""
             seenAuths.withLock { $0.append(auth) }
+            if request.url?.path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"msg":"OK","data":{"type":"checkin","value":"1529274209982060032"}}"#)
+            }
+            seenCheckInAuths.withLock { $0.append(auth) }
             return .json(200, #"{"code":0,"msg":"签到成功"}"#)
         }
 
@@ -1189,8 +1205,9 @@ final class CheckInOrchestratorTests: XCTestCase {
         XCTAssertEqual(store.results.count, 2)
         XCTAssertEqual(Set(store.results.map(\.accountId)), Set(["acc-1", "acc-3"]))
         XCTAssertTrue(store.results.allSatisfy { $0.state == .success })
-        XCTAssertEqual(seenAuths.get().count, 2)
-        XCTAssertEqual(Set(seenAuths.get()), Set(["Bearer tok-1", "Bearer tok-3"]))
+        XCTAssertEqual(seenCheckInAuths.get().count, 2)
+        XCTAssertEqual(Set(seenCheckInAuths.get()), Set(["Bearer tok-1", "Bearer tok-3"]))
+        XCTAssertEqual(Set(seenAuths.get()), Set(["Bearer tok-1", "Bearer tok-3"]), "未勾选账号 tok-2 绝不可发出任何网络请求")
         XCTAssertEqual(store.toastMessage, "签到完成：成功 2 / 2")
     }
 
@@ -1371,5 +1388,311 @@ final class CheckInOrchestratorTests: XCTestCase {
         XCTAssertEqual(store.results.count, 2)
         XCTAssertTrue(store.results.allSatisfy { $0.state == .dryRun })
         XCTAssertEqual(requestCount.get(), 0)
+    }
+
+    // MARK: - Official RainClassroom 1.3.6 Two-Step Dynamic QR Flow & Diagnostics
+
+    func testOfficialAppScanTwoStepDynamicQrFlowWithZeroActiveLessonCalls() async throws {
+        struct CapturedAppReq: Sendable {
+            let path: String
+            let xClient: String?
+            let auth: String?
+            let cachePolicyRaw: UInt
+            let body: [String: TemplateValue]?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let rawQr = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=abc+123&t=1763900000&s=sig+456"
+        let ticket = QrCodeParser.parse(rawQr, profile: profile)
+        XCTAssertEqual(ticket.kind, .dynamicCheckin)
+        XCTAssertNil(ticket.lessonId)
+
+        let captured = LockedBox<[CapturedAppReq]>([])
+        let discoverCalls = LockedBox(0)
+
+        let orchestrator = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            let body = MockNetworkSupport.requestBodyJSON(from: request)
+            captured.withLock {
+                $0.append(
+                    CapturedAppReq(
+                        path: path,
+                        xClient: MockNetworkSupport.headerValue("x-client", in: request),
+                        auth: MockNetworkSupport.headerValue("Authorization", in: request),
+                        cachePolicyRaw: request.cachePolicy.rawValue,
+                        body: body
+                    )
+                )
+            }
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                discoverCalls.withLock { $0 += 1 }
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            if path == "/api/v3/app/scan" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"OK","data":{"type":"checkin","value":"1529274209982060032","lesson_id":"1529274209982060032"}}"#,
+                    headers: ["set-auth": "Bearer app-scan-rotated-tok"]
+                )
+            }
+            if path == "/api/v3/lesson/checkin" {
+                return .json(200, #"{"code":0,"msg":"签到成功","data":{"lessonId":"1529274209982060032"}}"#)
+            }
+            return .json(404, #"{"code":40400,"msg":"接口不存在"}"#)
+        }
+
+        let result = await orchestrator.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(result.state, .success)
+        XCTAssertEqual(result.strategyId, "APP_SCAN_CHECKIN")
+        XCTAssertEqual(result.businessCode, 0)
+        XCTAssertEqual(discoverCalls.get(), 0, "官方两步扫码必须零前置 discoverActiveLesson 调用")
+        XCTAssertEqual(result.refreshedAccount?.bearer, "app-scan-rotated-tok")
+
+        let reqs = captured.get()
+        XCTAssertEqual(reqs.map(\.path), ["/api/v3/app/scan", "/api/v3/lesson/checkin"])
+
+        let step1 = try XCTUnwrap(reqs.first)
+        XCTAssertEqual(step1.xClient, "app")
+        XCTAssertEqual(step1.cachePolicyRaw, URLRequest.CachePolicy.reloadIgnoringLocalAndRemoteCacheData.rawValue)
+        XCTAssertEqual(step1.body?["url"]?.stringValue, rawQr, "app/scan 必须原样提交 ticket.raw")
+
+        let step2 = try XCTUnwrap(reqs.last)
+        XCTAssertEqual(step2.xClient, "app")
+        XCTAssertEqual(step2.auth, "Bearer app-scan-rotated-tok")
+        XCTAssertEqual(step2.body?["source"]?.intValue, 21)
+        XCTAssertEqual(step2.body?["lessonId"]?.stringValue, "1529274209982060032")
+        XCTAssertEqual(step2.body?["joinIfNotIn"]?.boolValue, true)
+
+        // 服务端识别为 login / classroom 时立即终止，不继续盲打签到接口
+        let loginCalls = LockedBox(0)
+        let loginOrch = makeOrchestrator(profile: profile) { request in
+            loginCalls.withLock { $0 += 1 }
+            if request.url?.path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"data":{"type":"app_web_login","value":"scene-1"}}"#)
+            }
+            return .json(200, #"{"code":0,"msg":"不应继续调用"}"#)
+        }
+        let loginRes = await loginOrch.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(loginCalls.get(), 1)
+        XCTAssertEqual(loginRes.state, .notInClass)
+        XCTAssertTrue(loginRes.message.contains("登录二维码"))
+
+        let classroomCalls = LockedBox(0)
+        let classroomOrch = makeOrchestrator(profile: profile) { request in
+            classroomCalls.withLock { $0 += 1 }
+            if request.url?.path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"data":{"type":"classroom","value":"889900"}}"#)
+            }
+            return .json(200, #"{"code":0,"msg":"不应继续调用"}"#)
+        }
+        let classroomRes = await classroomOrch.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(classroomCalls.get(), 1)
+        XCTAssertEqual(classroomRes.state, .notInClass)
+        XCTAssertTrue(classroomRes.message.contains("889900"))
+    }
+
+    func testAppScan51203AndCheckin50070And50019PreserveMappedReasonWithoutClobber() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let rawQr = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=exp1&t=1763900000&s=sig1"
+        let ticket = QrCodeParser.parse(rawQr, profile: profile)
+
+        // 1) /api/v3/app/scan 返回 51203 过期：原样保留 scanBean.msg 并立即中止
+        let calls51203 = LockedBox(0)
+        let orch51203 = makeOrchestrator(profile: profile) { _ in
+            calls51203.withLock { $0 += 1 }
+            return .json(200, #"{"code":51203,"msg":"动态二维码已过期，请重新扫码"}"#)
+        }
+        let res51203 = await orch51203.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(calls51203.get(), 1)
+        XCTAssertEqual(res51203.state, .qrExpired)
+        XCTAssertEqual(res51203.strategyId, "APP_SCAN_CHECKIN")
+        XCTAssertEqual(res51203.businessCode, 51203)
+        XCTAssertTrue(res51203.message.contains("动态二维码已过期，请重新扫码"))
+        XCTAssertTrue(res51203.diagnosticReason.contains("51203"))
+
+        // 2) Step 2 返回 50070，后续全部兜底返回 404 HTML：必须保留 50070 与清晰中文原因，绝不被 404/HTML 覆盖
+        let discoverCalls50070 = LockedBox(0)
+        let orch50070 = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                discoverCalls50070.withLock { $0 += 1 }
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            if path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"data":{"type":"checkin","value":"1529274209982060032"}}"#)
+            }
+            if path == "/api/v3/lesson/checkin",
+               MockNetworkSupport.requestBodyJSON(from: request)?["source"]?.intValue == 21 {
+                return .json(200, #"{"code":50070,"msg":"DYNAMIC QR CHECK IN REFUSED"}"#)
+            }
+            return .text(404, "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body>Not Found</body></html>", contentType: "text/html")
+        }
+        let res50070 = await orch50070.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(discoverCalls50070.get(), 0, "Step 1 已获得 lessonId，回退策略无需调用 discoverActiveLesson")
+        XCTAssertEqual(res50070.state, .failed)
+        XCTAssertEqual(res50070.strategyId, "APP_SCAN_CHECKIN")
+        XCTAssertEqual(res50070.businessCode, 50070)
+        XCTAssertTrue(res50070.message.contains("动态二维码校验未通过或课堂已结束"))
+        XCTAssertTrue(res50070.message.contains("DYNAMIC QR CHECK IN REFUSED"))
+        XCTAssertTrue(res50070.diagnosticReason.contains("50070"))
+
+        // 3) Step 2 返回 50019（未绑定学校身份），后续返回空 405：绝不被“身份”误判为 .authExpired，且不被 405 覆盖
+        let orch50019 = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            if path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"data":{"type":"checkin","value":"1529274209982060032"}}"#)
+            }
+            if path == "/api/v3/lesson/checkin",
+               MockNetworkSupport.requestBodyJSON(from: request)?["source"]?.intValue == 21 {
+                return .json(200, #"{"code":50019,"msg":"school identity required"}"#)
+            }
+            return .text(405, "")
+        }
+        let res50019 = await orch50019.checkIn(account: makeAccount(), ticket: ticket)
+        XCTAssertEqual(res50019.state, .notInClass, "50019 不得被 authKeywords 中的‘身份’误判为 .authExpired")
+        XCTAssertEqual(res50019.strategyId, "APP_SCAN_CHECKIN")
+        XCTAssertEqual(res50019.businessCode, 50019)
+        XCTAssertTrue(res50019.message.contains("账号未绑定学校身份"))
+        XCTAssertTrue(res50019.diagnosticReason.contains("50019"))
+    }
+
+    func testHttp403NonAuthRefusalAndHttp404RouteNotFoundDoNotFalseAbortFallback() async throws {
+        let profile = try TestBundleResources.loadProtocolProfile()
+
+        // 1) HTTP 403 非鉴权业务拒绝：绝不误判 .authExpired 中断后续策略；并验证 {"success": true} 识别为成功
+        let dynNoUrl = QrCodeParser.parse("c=abc&t=1763900000&s=sig&lessonId=888", profile: profile)
+        let seenSources = LockedBox<[Int]>([])
+        let orch403 = makeOrchestrator(profile: profile) { request in
+            let source = MockNetworkSupport.requestBodyJSON(from: request)?["source"]?.intValue ?? -1
+            seenSources.withLock { $0.append(source) }
+            if source == 14 {
+                return .json(403, #"{"code":40301,"msg":"当前来源不允许签到"}"#)
+            }
+            return .json(200, #"{"success":true,"msg":"ok"}"#)
+        }
+        let res403 = await orch403.checkIn(account: makeAccount(), ticket: dynNoUrl)
+        XCTAssertEqual(res403.state, .success)
+        XCTAssertEqual(res403.strategyId, "DYN_TICKET_5")
+        XCTAssertEqual(seenSources.get(), [14, 5], "HTTP 403 业务拒绝绝不能错误中止 DYN_TICKET_5 回退")
+
+        // 2) HTTP 404 “接口不存在”：绝不误判 .qrExpired，必须继续尝试 QR_URL_GET
+        let seenMethods = LockedBox<[String]>([])
+        let orch404 = makeOrchestrator(profile: profile) { request in
+            let method = request.httpMethod ?? "GET"
+            let path = request.url?.path ?? ""
+            seenMethods.withLock { $0.append("\(method) \(path)") }
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            if path == "/api/v3/custom/qr-fallback" && method == "POST" {
+                return .json(404, #"{"code":40400,"msg":"接口不存在"}"#)
+            }
+            if path == "/api/v3/custom/qr-fallback" && method == "GET" {
+                return .json(200, #"{"code":0,"msg":"GET 签到成功"}"#)
+            }
+            return .json(404, #"{"code":40400,"msg":"接口不存在"}"#)
+        }
+        let fallbackTicket = QrCodeParser.parse(
+            "https://www.yuketang.cn/api/v3/custom/qr-fallback?c=c1&t=1763900000&s=s1",
+            profile: profile
+        )
+        let res404 = await orch404.checkIn(account: makeAccount(), ticket: fallbackTicket)
+        XCTAssertEqual(res404.state, .success)
+        XCTAssertEqual(res404.strategyId, "QR_URL_GET")
+        XCTAssertTrue(seenMethods.get().contains("POST /api/v3/custom/qr-fallback"))
+        XCTAssertTrue(seenMethods.get().contains("GET /api/v3/custom/qr-fallback"))
+
+        // 3) HTML 200 内含 <script> token 字样不误判 .authExpired；HTTP 403 CSRF 正确判 .authExpired
+        let htmlWithToken = "<!DOCTYPE html><html><head><title>Service Error</title></head><body><script>const token='abc';</script></body></html>"
+        XCTAssertEqual(
+            orch403.classify(httpStatus: 200, businessCode: nil, message: nil, bodyText: htmlWithToken, isHtmlBody: true),
+            .failed
+        )
+        XCTAssertEqual(
+            orch403.classify(httpStatus: 403, businessCode: nil, message: "CSRF verification failed", bodyText: ""),
+            .authExpired
+        )
+    }
+
+    @MainActor
+    func testHtmlEmptyBodyDiagnosticsSameOriginRefererHostMismatchHintAndFailureToast() async throws {
+        struct DirectOriginPair: Sendable {
+            let origin: String?
+            let referer: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+
+        // 1) HTML / 空体响应诊断 + 脱敏 rawSnippet + 跨域名同源 Origin/Referer + 平台域名不一致提示
+        let directOrigins = LockedBox<[DirectOriginPair]>([])
+        let orchestrator = makeOrchestrator(profile: profile, maxAttemptsPerStrategy: 1, baseBackoffMs: 0) { request in
+            let host = request.url?.host?.lowercased() ?? ""
+            let path = request.url?.path ?? ""
+            if host == "pro.yuketang.cn" {
+                directOrigins.withLock {
+                    $0.append(
+                        DirectOriginPair(
+                            origin: MockNetworkSupport.headerValue("Origin", in: request),
+                            referer: MockNetworkSupport.headerValue("Referer", in: request)
+                        )
+                    )
+                }
+                return .text(404, "")
+            }
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            return .text(
+                502,
+                "<!DOCTYPE html><html><head><title>Bad Gateway</title></head><body>Authorization: Bearer SECRET_SHOULD_REDACT</body></html>",
+                contentType: "text/html; charset=utf-8"
+            )
+        }
+
+        let crossHostTicket = QrCodeParser.parse(
+            "https://pro.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=cross1&t=1763900000&s=sig1",
+            profile: profile
+        )
+        let wwwAccount = makeAccount(id: "acc-www", label: "主站账号", host: "www.yuketang.cn")
+        let res = await orchestrator.checkIn(account: wwwAccount, ticket: crossHostTicket)
+
+        XCTAssertTrue(res.state.isFailureLike)
+        XCTAssertFalse(res.diagnosticReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        XCTAssertFalse(res.message.contains("<!DOCTYPE html>"), "HTML 响应不得直接输出原始 DOCTYPE 标签")
+        XCTAssertTrue(res.message.contains("Bad Gateway") || res.message.contains("HTML"))
+        XCTAssertTrue(res.message.contains("www.yuketang.cn"), "域名不一致时应提示账号平台域名")
+        XCTAssertTrue(res.message.contains("pro.yuketang.cn"), "域名不一致时应提示二维码域名")
+
+        let report = res.diagnosticReportText
+        XCTAssertFalse(report.contains("SECRET_SHOULD_REDACT"), "诊断报告绝不能泄露 Bearer 凭据")
+        XCTAssertTrue(res.attempts.allSatisfy { !($0.rawSnippet?.contains("SECRET_SHOULD_REDACT") ?? false) })
+
+        let directHeaders = directOrigins.get()
+        XCTAssertFalse(directHeaders.isEmpty)
+        for pair in directHeaders {
+            XCTAssertEqual(pair.origin, "https://pro.yuketang.cn")
+            XCTAssertEqual(pair.referer, "https://pro.yuketang.cn/v2/web/index", "直连 QR_URL 必须保持 Origin 与 Referer 同源")
+        }
+
+        // 2) AppStore 失败完成 Toast 必须直接携带具体失败原因而非裸“签到完成：成功 0 / 1”
+        let vault = InMemoryAccountVault()
+        let failSession = MockNetworkSupport.makeSession { _ in
+            .json(200, #"{"code":51203,"msg":"二维码已过期，请重新扫码"}"#)
+        }
+        let store = AppStore(vault: vault, profile: profile, session: failSession)
+        try store.addOrUpdateAccount(makeAccount(id: "toast-acc", label: "王同学"))
+        store.applyQrInput("https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=t1&t=1763900000&s=s1")
+        store.startCheckIn()
+
+        var ticks = 0
+        while store.isCheckingIn && ticks < 100 {
+            ticks += 1
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertFalse(store.isCheckingIn)
+        let toast = try XCTUnwrap(store.toastMessage)
+        XCTAssertTrue(toast.contains("签到失败（0/1）"), "失败 Toast 应包含失败计数: \(toast)")
+        XCTAssertTrue(toast.contains("二维码已过期"), "失败 Toast 必须包含具体失败原因: \(toast)")
     }
 }

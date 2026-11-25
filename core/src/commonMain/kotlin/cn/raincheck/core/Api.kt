@@ -91,13 +91,17 @@ class RainCheckApi(
         val query = Template.renderMap(endpoint.query, vars)
         val url = buildUrl(base, path, query)
         val body = endpoint.body?.let { Template.renderBody(it, vars) }
+        val mergedHeaders = buildMap {
+            endpoint.headers.forEach { (k, v) -> put(k, Template.render(v, vars)) }
+            extraHeaders.forEach { (k, v) -> put(k, v) }
+        }
         return execute(
             account = if (endpoint.auth) account else null,
             method = endpoint.method,
             url = url,
             body = body,
             referer = referer,
-            extraHeaders = extraHeaders,
+            extraHeaders = mergedHeaders,
         )
     }
 
@@ -206,8 +210,14 @@ class RainCheckApi(
                     if (k.equals("desktop-v", ignoreCase = true)) return@forEach
                     val trimmed = v.trim()
                     when {
-                        k.equals("X-Client", ignoreCase = true) && trimmed.equals("desktop", ignoreCase = true) -> {
-                            setUniqueHeader("X-Client", "web")
+                        k.equals("X-Client", ignoreCase = true) -> {
+                            val normalizedClient = if (trimmed.isEmpty() || trimmed.equals("desktop", ignoreCase = true)) {
+                                "web"
+                            } else {
+                                trimmed
+                            }
+                            headers.remove("X-Client")
+                            setUniqueHeader(k, normalizedClient)
                         }
                         k.equals(HttpHeaders.Origin, ignoreCase = true) && trimmed.startsWith("file://", ignoreCase = true) -> {
                             if (origin != null) setUniqueHeader(HttpHeaders.Origin, origin)
@@ -240,17 +250,25 @@ class RainCheckApi(
         }
 
         val parsed = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
+        val codeKeys = (profile.result.allCodeKeys() + listOf("statusCode", "errno")).distinct()
         val code = parsed?.let { obj ->
-            profile.result.allCodeKeys().firstNotNullOfOrNull { key -> obj[key].asNonNullIntOrNull() }
+            codeKeys.firstNotNullOfOrNull { key -> obj[key].asNonNullIntOrNull() }
         }
+        val msgKeys = (profile.result.allMessageKeys() + listOf("err", "info", "reason", "status_msg")).distinct()
         val message = parsed?.let { obj ->
-            profile.result.allMessageKeys().firstNotNullOfOrNull { key ->
+            msgKeys.firstNotNullOfOrNull { key ->
                 obj[key].asNonNullStringOrNull()?.takeIf { it.isNotBlank() }
-            }
+            } ?: (obj["data"] as? JsonObject)?.let { dataObj ->
+                msgKeys.firstNotNullOfOrNull { key ->
+                    dataObj[key].asNonNullStringOrNull()?.takeIf { it.isNotBlank() }
+                }
+            } ?: obj["data"].asNonNullStringOrNull()?.takeIf { it.isNotBlank() }
         }
         val httpStatus = response.status.value
-        val auth = if (httpStatus in 200..399) extractAuth(response, account) else null
-        val businessOk = (httpStatus in 200..299) && profile.result.isOkCode(code)
+        val auth = if (httpStatus in 200..399 || httpStatus == 403) extractAuth(response, account) else null
+        val successFlag = parsed?.get("success").asNonNullBoolOrNull() == true
+        val businessOk = (httpStatus in 200..299) &&
+            (profile.result.isOkCode(code) || (code == null && successFlag))
 
         return ApiResult(
             httpStatus = httpStatus,

@@ -50,6 +50,10 @@ struct ApiCallResult: Sendable {
     let ok: Bool
     let requestMethod: String
     let requestUrl: String
+    let finalUrl: String?
+    let rawSnippet: String?
+    let isHtmlBody: Bool
+    let jsonSuccess: Bool?
     let isTimeout: Bool
     let isCancelled: Bool
 
@@ -65,6 +69,10 @@ struct ApiCallResult: Sendable {
         ok: Bool,
         requestMethod: String,
         requestUrl: String,
+        finalUrl: String? = nil,
+        rawSnippet: String? = nil,
+        isHtmlBody: Bool = false,
+        jsonSuccess: Bool? = nil,
         isTimeout: Bool = false,
         isCancelled: Bool = false
     ) {
@@ -79,6 +87,10 @@ struct ApiCallResult: Sendable {
         self.ok = ok
         self.requestMethod = requestMethod
         self.requestUrl = requestUrl
+        self.finalUrl = finalUrl
+        self.rawSnippet = rawSnippet
+        self.isHtmlBody = isHtmlBody
+        self.jsonSuccess = jsonSuccess
         self.isTimeout = isTimeout
         self.isCancelled = isCancelled
     }
@@ -93,6 +105,31 @@ struct ApiCallResult: Sendable {
 
     func firstNonBlankDataString(_ keys: String...) -> String? {
         dataObject?.firstNonBlankString(keys)
+    }
+
+    /// 面向诊断展示的可读摘要（绝不输出空白字符串或原始 HTML 源码）。
+    var diagnosticSummary: String {
+        if httpStatus == -1 {
+            let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "网络连接异常" : (CredentialSanitizer.sanitizeDiagnosticSnippet(trimmed, maxLength: 160) ?? "网络连接异常")
+        }
+        if let msg = message?.trimmingCharacters(in: .whitespacesAndNewlines), !msg.isEmpty {
+            return msg
+        }
+        if isHtmlBody {
+            if let title = RainCheckClient.extractHTMLTitle(from: bodyText) {
+                return "服务器返回 HTML 页面：\(title)（HTTP \(httpStatus)）"
+            }
+            return "服务器返回 HTML 页面（HTTP \(httpStatus)）"
+        }
+        if let snippet = rawSnippet?.trimmingCharacters(in: .whitespacesAndNewlines), !snippet.isEmpty {
+            return snippet
+        }
+        let trimmedBody = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedBody.isEmpty {
+            return CredentialSanitizer.sanitizeDiagnosticSnippet(trimmedBody, maxLength: 160) ?? "HTTP \(httpStatus)"
+        }
+        return "HTTP \(httpStatus)（空响应）"
     }
 }
 
@@ -189,7 +226,7 @@ final class RainCheckClient: Sendable {
             throw RainCheckClientError.networkError(finalResult.bodyText)
         }
         if !finalResult.ok {
-            let msg = finalResult.message ?? "验证账号失败 (HTTP \(finalResult.httpStatus))"
+            let msg = finalResult.message ?? "验证账号失败（\(finalResult.diagnosticSummary)）"
             if isAuthFailure(finalResult) {
                 throw RainCheckClientError.authFailed(msg)
             }
@@ -266,6 +303,15 @@ final class RainCheckClient: Sendable {
         let urlString = TemplateRenderer.buildURL(base: base, path: renderedPath, query: renderedQuery)
         let renderedBody = endpoint.body.map { TemplateRenderer.renderBody($0, variables: variables) }
 
+        var mergedHeaders = endpoint.headers
+        for (extraKey, extraVal) in extraHeaders {
+            // 大小写不敏感去重覆盖 endpoint.headers
+            for existingKey in Array(mergedHeaders.keys) where existingKey.caseInsensitiveCompare(extraKey) == .orderedSame {
+                mergedHeaders.removeValue(forKey: existingKey)
+            }
+            mergedHeaders[extraKey] = extraVal
+        }
+
         return await performRequest(
             account: endpoint.auth ? account : nil,
             method: endpoint.method,
@@ -273,7 +319,8 @@ final class RainCheckClient: Sendable {
             body: renderedBody,
             extraCookies: extraCookies,
             referer: referer,
-            extraHeaders: extraHeaders,
+            extraHeaders: mergedHeaders,
+            alignRefererToTargetOrigin: false,
             timeoutInterval: timeoutInterval
         )
     }
@@ -288,6 +335,7 @@ final class RainCheckClient: Sendable {
             extraCookies: [:],
             referer: nil,
             extraHeaders: [:],
+            alignRefererToTargetOrigin: true,
             timeoutInterval: nil
         )
     }
@@ -307,11 +355,12 @@ final class RainCheckClient: Sendable {
             extraCookies: [:],
             referer: referer,
             extraHeaders: [:],
+            alignRefererToTargetOrigin: true,
             timeoutInterval: nil
         )
     }
 
-    // MARK: - JSON Parsing (CFBoolean Safe)
+    // MARK: - JSON Parsing & HTML Diagnostics (CFBoolean Safe)
 
     /// 使用 `JSONSerialization` + `CFBooleanGetTypeID()` 显式区分布尔与数字，规避 `false == 0` 陷阱。
     static func parseJSONObject(from data: Data) -> [String: TemplateValue]? {
@@ -328,6 +377,85 @@ final class RainCheckClient: Sendable {
         return output
     }
 
+    static func looksLikeHTML(_ text: String, contentType: String? = nil) -> Bool {
+        if let ct = contentType?.lowercased(),
+           ct.contains("text/html") || ct.contains("application/xhtml") {
+            return true
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lowerPrefix = String(trimmed.prefix(256)).lowercased()
+        return lowerPrefix.hasPrefix("<!doctype html")
+            || lowerPrefix.hasPrefix("<html")
+            || lowerPrefix.hasPrefix("<head")
+            || lowerPrefix.hasPrefix("<body")
+            || lowerPrefix.contains("<html")
+            || lowerPrefix.contains("<!doctype html")
+    }
+
+    static func extractHTMLTitle(from html: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"(?is)<title\b[^>]*>(.*?)</title>"#, options: []) else {
+            return nil
+        }
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        guard let match = regex.firstMatch(in: html, options: [], range: range),
+              match.numberOfRanges > 1,
+              let titleRange = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+        let rawTitle = String(html[titleRange])
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+        return CredentialSanitizer.sanitizeDiagnosticSnippet(rawTitle, maxLength: 80)
+    }
+
+    private static func strictNonBlankString(_ value: TemplateValue?) -> String? {
+        guard case .string(let str) = value else { return nil }
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func extractBusinessCode(from parsedJSON: [String: TemplateValue]) -> Int? {
+        var keys = profile.result.allCodeKeys()
+        for fallbackKey in ["error_code", "status_code", "statusCode", "errno"] where !keys.contains(fallbackKey) {
+            keys.append(fallbackKey)
+        }
+        for key in keys {
+            if let val = parsedJSON[key]?.intValue {
+                return val
+            }
+        }
+        return nil
+    }
+
+    private func extractMessage(from parsedJSON: [String: TemplateValue]) -> String? {
+        var keys = profile.result.allMessageKeys()
+        for fallbackKey in ["errormsg", "detail", "error", "err", "info", "reason", "status_msg", "statusMsg"]
+            where !keys.contains(fallbackKey) {
+            keys.append(fallbackKey)
+        }
+        for key in keys {
+            if let str = Self.strictNonBlankString(parsedJSON[key]) {
+                return str
+            }
+        }
+        if let nestedData = parsedJSON["data"]?.objectValue {
+            for key in ["msg", "message", "errmsg", "errormsg", "detail", "error", "reason"] {
+                if let str = Self.strictNonBlankString(nestedData[key]) {
+                    return str
+                }
+            }
+        }
+        if let directDataString = Self.strictNonBlankString(parsedJSON["data"]) {
+            return directDataString
+        }
+        return nil
+    }
+
     // MARK: - Core HTTP Pipeline
 
     private func performRequest(
@@ -338,6 +466,7 @@ final class RainCheckClient: Sendable {
         extraCookies: [String: String],
         referer: String?,
         extraHeaders: [String: String],
+        alignRefererToTargetOrigin: Bool = false,
         timeoutInterval: TimeInterval? = nil
     ) async -> ApiCallResult {
         let normalizedMethod = method.uppercased()
@@ -361,6 +490,8 @@ final class RainCheckClient: Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = normalizedMethod
+        // 禁止本地/远端 URLCache 返回陈旧响应（避免进行中课堂列表或动态码接口读到缓存）
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let resolvedTimeout = timeoutInterval ?? Self.defaultTimeoutInterval
         request.timeoutInterval = resolvedTimeout > 0 ? resolvedTimeout : Self.defaultTimeoutInterval
         // 禁用系统共享 Cookie 池，彻底避免多账号并发串号或单测间污染
@@ -424,10 +555,22 @@ final class RainCheckClient: Sendable {
 
         applyAuthAndCookies(to: &request, account: account, extraCookies: extraCookies)
 
+        // 若为直接二维码 URL 请求（QR_URL_POST / QR_URL_GET），确保 Origin 与 Referer 严格来自目标 URL 同源，绝不混用 account.host Referer
         if let referer, !referer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            request.setValue(referer, forHTTPHeaderField: "Referer")
+            if alignRefererToTargetOrigin,
+               let targetOrigin = origin,
+               let refUrl = URL(string: referer),
+               let refOrigin = Self.sameOrigin(for: refUrl),
+               refOrigin.caseInsensitiveCompare(targetOrigin) != .orderedSame {
+                request.setValue("\(targetOrigin)/v2/web/index", forHTTPHeaderField: "Referer")
+            } else {
+                request.setValue(referer, forHTTPHeaderField: "Referer")
+            }
+        } else if alignRefererToTargetOrigin, let targetOrigin = origin {
+            request.setValue("\(targetOrigin)/v2/web/index", forHTTPHeaderField: "Referer")
         }
 
+        var isAppClientOverride = false
         for (headerKey, headerValue) in extraHeaders {
             if body != nil && headerKey.caseInsensitiveCompare("Content-Type") == .orderedSame {
                 continue
@@ -436,9 +579,15 @@ final class RainCheckClient: Sendable {
                 continue
             }
             let trimmedValue = headerValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if headerKey.caseInsensitiveCompare("X-Client") == .orderedSame,
-               trimmedValue.caseInsensitiveCompare("desktop") == .orderedSame {
-                request.setValue("web", forHTTPHeaderField: "X-Client")
+            if headerKey.caseInsensitiveCompare("X-Client") == .orderedSame {
+                if !trimmedValue.isEmpty {
+                    if trimmedValue.caseInsensitiveCompare("app") == .orderedSame {
+                        isAppClientOverride = true
+                    }
+                    // 尊重接口级 x-client 声明（例如官方 App 扫码的 x-client: app），先清旧键防止大小写冲突
+                    request.setValue(nil, forHTTPHeaderField: "X-Client")
+                    request.setValue(trimmedValue, forHTTPHeaderField: headerKey)
+                }
                 continue
             }
             if headerKey.caseInsensitiveCompare("Origin") == .orderedSame,
@@ -449,6 +598,12 @@ final class RainCheckClient: Sendable {
                 continue
             }
             request.setValue(headerValue, forHTTPHeaderField: headerKey)
+        }
+
+        if isAppClientOverride,
+           let uid = account?.userId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !uid.isEmpty {
+            request.setValue(uid, forHTTPHeaderField: "X-UID")
         }
 
         if let body {
@@ -480,37 +635,52 @@ final class RainCheckClient: Sendable {
                 ok: false,
                 requestMethod: normalizedMethod,
                 requestUrl: urlString,
+                finalUrl: nil,
+                rawSnippet: CredentialSanitizer.sanitizeDiagnosticSnippet(error.localizedDescription, maxLength: 200),
+                isHtmlBody: false,
+                jsonSuccess: nil,
                 isTimeout: timedOut,
                 isCancelled: cancelled
             )
         }
 
         let elapsed = max(0, RainCheckTime.nowMillis() - startedMs)
-        let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
-        let bodyText = String(data: data, encoding: .utf8) ?? ""
-        let parsedJSON = Self.parseJSONObject(from: data)
+        let httpResponse = response as? HTTPURLResponse
+        let httpStatus = httpResponse?.statusCode ?? -1
+        let finalUrl = httpResponse?.url?.absoluteString
+        let contentType = httpResponse?.value(forHTTPHeaderField: "Content-Type")
 
-        let businessCode: Int? = parsedJSON.flatMap { obj in
-            for key in profile.result.allCodeKeys() {
-                if let val = obj[key]?.intValue {
-                    return val
-                }
-            }
-            return nil
+        let bodyText: String
+        if data.isEmpty {
+            bodyText = ""
+        } else if let utf8 = String(data: data, encoding: .utf8) {
+            bodyText = utf8
+        } else if let latin1 = String(data: data, encoding: .isoLatin1) {
+            bodyText = latin1
+        } else {
+            bodyText = "<binary \(data.count) bytes>"
         }
 
-        let message: String? = parsedJSON.flatMap { obj in
-            for key in profile.result.allMessageKeys() {
-                if let str = obj[key]?.stringValue,
-                   !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return str
-                }
+        let parsedJSON = Self.parseJSONObject(from: data)
+        let isHtml = (parsedJSON == nil) && Self.looksLikeHTML(bodyText, contentType: contentType)
+
+        let businessCode = parsedJSON.flatMap { extractBusinessCode(from: $0) }
+        let message = parsedJSON.flatMap { extractMessage(from: $0) }
+        let jsonSuccess = parsedJSON?["success"]?.boolValue
+
+        let rawSnippet: String?
+        if isHtml {
+            if let title = Self.extractHTMLTitle(from: bodyText) {
+                rawSnippet = CredentialSanitizer.sanitizeDiagnosticSnippet("HTML <title>: \(title)", maxLength: 200)
+            } else {
+                rawSnippet = CredentialSanitizer.sanitizeDiagnosticSnippet(bodyText, maxLength: 200)
             }
-            return nil
+        } else {
+            rawSnippet = CredentialSanitizer.sanitizeDiagnosticSnippet(bodyText, maxLength: 200)
         }
 
         let extracted: (auth: AuthUpdate?, cookies: [String: String])
-        if (200...399).contains(httpStatus), let httpResponse = response as? HTTPURLResponse {
+        if let httpResponse, ((200...399).contains(httpStatus) || httpStatus == 403) {
             extracted = extractAuthAndCookies(
                 from: httpResponse,
                 responseURL: httpResponse.url ?? url,
@@ -520,7 +690,9 @@ final class RainCheckClient: Sendable {
             extracted = (nil, [:])
         }
 
-        let isOk = (200...299).contains(httpStatus) && profile.result.isOkCode(businessCode)
+        let hasExplicitOkCode = profile.result.isOkCode(businessCode)
+        let isSuccessFlagOk = (jsonSuccess == true) && (businessCode == nil || hasExplicitOkCode)
+        let isOk = (200...299).contains(httpStatus) && (hasExplicitOkCode || isSuccessFlagOk)
 
         return ApiCallResult(
             httpStatus: httpStatus,
@@ -533,7 +705,11 @@ final class RainCheckClient: Sendable {
             responseCookies: extracted.cookies,
             ok: isOk,
             requestMethod: normalizedMethod,
-            requestUrl: urlString
+            requestUrl: urlString,
+            finalUrl: finalUrl,
+            rawSnippet: rawSnippet,
+            isHtmlBody: isHtml,
+            jsonSuccess: jsonSuccess
         )
     }
 
@@ -751,15 +927,22 @@ final class RainCheckClient: Sendable {
         if result.httpStatus == 401 || result.httpStatus == 403 {
             return true
         }
-        let trimmedMessage = result.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let text = trimmedMessage.isEmpty ? result.bodyText : trimmedMessage
-        if matchesKeyword(text, keywords: profile.result.authKeywords) {
-            return true
-        }
         if result.businessCode == 401 {
             return true
         }
         if result.businessCode == 50000 && !(500...599).contains(result.httpStatus) {
+            return true
+        }
+        let trimmedMessage = result.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text: String
+        if !trimmedMessage.isEmpty {
+            text = trimmedMessage
+        } else if result.isHtmlBody {
+            text = Self.extractHTMLTitle(from: result.bodyText) ?? ""
+        } else {
+            text = result.bodyText
+        }
+        if matchesKeyword(text, keywords: profile.result.authKeywords) {
             return true
         }
         return false

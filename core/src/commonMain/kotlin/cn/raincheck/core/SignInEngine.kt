@@ -94,11 +94,12 @@ class SignInEngine(
             )
         }
 
+        val runAppScanFirst = shouldRunAppScan(ticket, options)
         val allCandidates = strategiesFor(ticket).let { list ->
             val wanted = options.strategyIds?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() }
             if (wanted == null) list else list.filter { wanted.contains(it.id) }
         }
-        if (allCandidates.isEmpty()) {
+        if (allCandidates.isEmpty() && !runAppScanFirst) {
             return SignResult(
                 accountId = account.id,
                 label = account.label,
@@ -108,8 +109,11 @@ class SignInEngine(
             )
         }
 
-        // 演练模式：绝对不发起任何网络请求（包括跳过 discover()！）
+        // 演练模式：绝对不发起任何网络请求（包括跳过 appScan 与 discover()！）
         if (options.dryRun) {
+            if (runAppScanFirst) {
+                attempts += simulateAppScanDryRun(currentRef.account, ticket)
+            }
             val dryContext = LessonContext(
                 lessonId = ticket.lessonId ?: "<discover>",
                 classroomId = ticket.classroomId,
@@ -123,16 +127,34 @@ class SignInEngine(
                 label = currentRef.account.label,
                 state = SignState.DRY_RUN,
                 message = "演练模式：已模拟 ${attempts.size} 条策略，未发起网络请求",
-                strategy = allCandidates.firstOrNull()?.id,
+                strategy = attempts.firstOrNull()?.strategy ?: allCandidates.firstOrNull()?.id,
                 lessonId = ticket.lessonId,
                 attempts = attempts,
             )
         }
 
-        // 解析课堂上下文；无 lessonId 时调用 discover() 且绝不吞掉 401/403 与网络异常
+        // 优先级 #1：官方 IPA 1.3.6 两步扫码签到（POST /api/v3/app/scan -> POST /api/v3/lesson/checkin source=21）
+        // 在 discover() 之前直接执行，避免在 5–8s 动态二维码上浪费额外 RTT。
+        var appScanContext: LessonContext? = null
+        var bestFailure: Pair<StrategyAttempt, SignState>? = null
+        if (runAppScanFirst) {
+            when (val appScanOutcome = runAppScanCheckin(currentRef, ticket, options, attempts)) {
+                is AppScanOutcome.Terminal -> return appScanOutcome.result
+                is AppScanOutcome.Fallthrough -> {
+                    appScanContext = appScanOutcome.discoveredContext
+                    if (appScanOutcome.bestFailure != null) {
+                        bestFailure = appScanOutcome.bestFailure
+                    }
+                }
+            }
+        }
+
+        // 解析课堂上下文；无 lessonId 时优先复用 appScan 解析结果，再调用 discover() 且绝不吞掉 401/403 与网络异常
         var discoverFailure: DiscoverOutcome? = null
         val context: LessonContext? = when {
             ticket.lessonId != null -> LessonContext(ticket.lessonId, ticket.classroomId)
+            appScanContext != null -> appScanContext
+            allCandidates.isEmpty() -> null
             else -> when (val outcome = discoverDetailed(currentRef, ticket)) {
                 is DiscoverOutcome.Found -> outcome.context
                 is DiscoverOutcome.AuthRequired -> {
@@ -141,7 +163,7 @@ class SignInEngine(
                         label = currentRef.account.label,
                         state = SignState.AUTH_REQUIRED,
                         message = outcome.message,
-                        attempts = listOf(outcome.attempt),
+                        attempts = attempts + outcome.attempt,
                     )
                 }
                 is DiscoverOutcome.NetworkError, is DiscoverOutcome.NotFound -> {
@@ -162,31 +184,49 @@ class SignInEngine(
         }
 
         if (candidates.isEmpty()) {
+            if (allCandidates.isEmpty() && attempts.isNotEmpty()) {
+                val chosen = bestFailure
+                val lastAttempt = chosen?.first ?: attempts.last()
+                val finalState = chosen?.second ?: classify(lastAttempt).let {
+                    if (it == SignState.SUCCESS || it == SignState.ALREADY) SignState.FAILED else it
+                }
+                return SignResult(
+                    accountId = currentRef.account.id,
+                    label = currentRef.account.label,
+                    state = finalState,
+                    message = lastAttempt.message?.takeIf { it.isNotBlank() } ?: "APP_SCAN_CHECKIN 未通过",
+                    strategy = lastAttempt.strategy,
+                    lessonId = appScanContext?.lessonId ?: ticket.lessonId,
+                    attempts = attempts,
+                )
+            }
             return when (val fail = discoverFailure) {
                 is DiscoverOutcome.NetworkError -> SignResult(
                     accountId = currentRef.account.id,
                     label = currentRef.account.label,
                     state = SignState.ERROR,
                     message = fail.message,
-                    attempts = listOf(fail.attempt),
+                    attempts = attempts + fail.attempt,
                 )
                 is DiscoverOutcome.NotFound -> SignResult(
                     accountId = currentRef.account.id,
                     label = currentRef.account.label,
                     state = SignState.NO_CONTEXT,
-                    message = fail.message,
-                    attempts = listOfNotNull(fail.attempt),
+                    message = bestFailure?.first?.message?.takeIf { it.isNotBlank() } ?: fail.message,
+                    attempts = attempts + listOfNotNull(fail.attempt),
                 )
                 else -> SignResult(
                     accountId = currentRef.account.id,
                     label = currentRef.account.label,
                     state = SignState.NO_CONTEXT,
-                    message = "无法确定 lessonId，请确认二维码属于进行中的课堂",
+                    message = bestFailure?.first?.message?.takeIf { it.isNotBlank() }
+                        ?: "无法确定 lessonId，请确认二维码属于进行中的课堂",
+                    attempts = attempts,
                 )
             }
         }
 
-        var lastMessage = "所有策略均被拒绝"
+        var lastMessage = bestFailure?.first?.message?.takeIf { it.isNotBlank() } ?: "所有策略均被拒绝"
         for (spec in candidates) {
             val variables = buildVars(currentRef.account, context, ticket, spec)
             val strategyAttempts = runStrategy(currentRef, spec, variables, context, ticket, options)
@@ -207,6 +247,9 @@ class SignInEngine(
                 )
             }
 
+            if (isMoreInformativeFailure(finalAttempt, bestFailure?.first)) {
+                bestFailure = finalAttempt to classified
+            }
             lastMessage = finalAttempt.message?.takeIf { it.isNotBlank() } ?: lastMessage
             if (classified == SignState.AUTH_REQUIRED) {
                 return SignResult(
@@ -234,8 +277,10 @@ class SignInEngine(
         }
 
         val networkAttempts = attempts.filter { it.httpStatus != null }
+        val chosenFailure = bestFailure
         val finalState = when {
             networkAttempts.isNotEmpty() && networkAttempts.all { classify(it) == SignState.ERROR } -> SignState.ERROR
+            chosenFailure != null -> chosenFailure.second
             else -> attempts.lastOrNull()?.let { classify(it) } ?: SignState.FAILED
         }
         val safeFinalState = if (finalState == SignState.SUCCESS || finalState == SignState.ALREADY) {
@@ -243,13 +288,15 @@ class SignInEngine(
         } else {
             finalState
         }
+        val finalMessage = chosenFailure?.first?.message?.takeIf { it.isNotBlank() } ?: lastMessage
+        val finalStrategy = chosenFailure?.first?.strategy ?: attempts.lastOrNull()?.strategy
 
         return SignResult(
             accountId = currentRef.account.id,
             label = currentRef.account.label,
             state = safeFinalState,
-            message = lastMessage,
-            strategy = attempts.lastOrNull()?.strategy,
+            message = finalMessage,
+            strategy = finalStrategy,
             lessonId = context?.lessonId,
             attempts = attempts,
         )
@@ -336,8 +383,7 @@ class SignInEngine(
         }
 
         if (active.ok) {
-            val data = active.data()
-            val lessons = data?.let { findLessonObjects(it) }.orEmpty()
+            val lessons = extractLessonsFromResponse(active)
             val matched = when {
                 ticket?.classroomId != null ->
                     lessons.firstOrNull { it.classroomId == ticket.classroomId } ?: lessons.firstOrNull()
@@ -350,6 +396,238 @@ class SignInEngine(
             message = "无法确定 lessonId，请确认二维码属于进行中的课堂",
             attempt = attempt,
         )
+    }
+
+    // ---------------------------------------------------------------- 官方两步扫码签到（IPA 1.3.6）
+
+    private fun shouldRunAppScan(ticket: QrTicket, options: SignOptions): Boolean {
+        if (!profile.endpoints.containsKey("appScan") || !profile.endpoints.containsKey("checkinAppScan")) {
+            return false
+        }
+        if (ticket.kind == TicketKind.LOGIN || ticket.raw.isBlank()) return false
+        val wanted = options.strategyIds?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() }
+        if (wanted != null) return wanted.contains(APP_SCAN_STRATEGY_ID)
+        return ticket.url != null || ticket.kind == TicketKind.UNKNOWN
+    }
+
+    private fun simulateAppScanDryRun(account: Account, ticket: QrTicket): StrategyAttempt {
+        val endpoint = profile.endpoint("appScan")
+        val vars = Template.varsOf("qrRaw" to ticket.raw)
+        val base = "${account.scheme}://${account.host}"
+        val path = Template.renderPath(endpoint.path, vars)
+        val url = api.buildUrl(base, path, Template.renderMap(endpoint.query, vars))
+        val body = endpoint.body?.let { Template.renderBody(it, vars) }
+        return StrategyAttempt(
+            strategy = APP_SCAN_STRATEGY_ID,
+            ok = false,
+            message = "演练模式，未发送",
+            requestLine = "${endpoint.method} $url",
+            requestBody = body?.toString(),
+        )
+    }
+
+    private suspend fun runAppScanCheckin(
+        currentRef: AccountRef,
+        ticket: QrTicket,
+        options: SignOptions,
+        attempts: MutableList<StrategyAttempt>,
+    ): AppScanOutcome {
+        val scanEndpoint = profile.endpoint("appScan")
+        val scanVars = Template.varsOf("qrRaw" to ticket.raw)
+        val scanBase = "${currentRef.account.scheme}://${currentRef.account.host}"
+        val scanUrl = api.buildUrl(
+            scanBase,
+            Template.renderPath(scanEndpoint.path, scanVars),
+            Template.renderMap(scanEndpoint.query, scanVars),
+        )
+        val scanReqBody = scanEndpoint.body?.let { Template.renderBody(it, scanVars) }
+
+        val scanRes = api.call(
+            account = currentRef.account,
+            endpointName = "appScan",
+            vars = scanVars,
+        )
+        applyAuthUpdateIfChanged(currentRef, scanRes.auth, markOk = scanRes.ok)
+
+        val scanMsg = resolveAttemptMessage(scanRes)
+        val scanAttempt = StrategyAttempt(
+            strategy = APP_SCAN_STRATEGY_ID,
+            httpStatus = scanRes.httpStatus,
+            code = scanRes.code,
+            message = scanMsg,
+            ok = false,
+            requestLine = "${scanEndpoint.method} $scanUrl",
+            requestBody = scanReqBody?.toString(),
+            responseBody = scanRes.body.take(2000),
+            elapsedMs = scanRes.elapsedMs,
+        )
+
+        if (scanRes.httpStatus == 401 ||
+            scanRes.code == 401 ||
+            (!scanRes.ok &&
+                scanRes.httpStatus != -1 &&
+                scanRes.code !in OFFICIAL_NON_AUTH_CODES &&
+                !isHtmlBody(scanRes.body) &&
+                matchesAnyKeyword(scanMsg, profile.result.authKeywords))
+        ) {
+            attempts += scanAttempt
+            return AppScanOutcome.Terminal(
+                SignResult(
+                    accountId = currentRef.account.id,
+                    label = currentRef.account.label,
+                    state = SignState.AUTH_REQUIRED,
+                    message = scanMsg.ifBlank { "扫码鉴权失败 (HTTP ${scanRes.httpStatus})" },
+                    strategy = APP_SCAN_STRATEGY_ID,
+                    lessonId = ticket.lessonId,
+                    attempts = attempts,
+                ),
+            )
+        }
+
+        if (scanRes.httpStatus in 200..299 && profile.result.isOkCode(scanRes.code)) {
+            val data = scanRes.data()
+            val scanType = data?.firstNonBlankString("type")?.lowercase()
+            val scanValue = data?.firstNonBlankString("value", "lesson_id", "lessonId")
+            val scanClassroomId = data?.firstNonBlankString("classroom_id", "classroomId") ?: ticket.classroomId
+
+            if (scanType == "login" || scanType == "app_web_login") {
+                val msg = "服务端识别为登录二维码而非课堂签到码"
+                attempts += scanAttempt.copy(message = msg)
+                return AppScanOutcome.Terminal(
+                    SignResult(
+                        accountId = currentRef.account.id,
+                        label = currentRef.account.label,
+                        state = SignState.NO_CONTEXT,
+                        message = msg,
+                        strategy = APP_SCAN_STRATEGY_ID,
+                        attempts = attempts,
+                    ),
+                )
+            }
+            if (scanType == "classroom") {
+                val msg = "这是加班二维码而非签到码（classroomId=${scanValue.orEmpty()}）"
+                attempts += scanAttempt.copy(message = msg)
+                return AppScanOutcome.Terminal(
+                    SignResult(
+                        accountId = currentRef.account.id,
+                        label = currentRef.account.label,
+                        state = SignState.FAILED,
+                        message = msg,
+                        strategy = APP_SCAN_STRATEGY_ID,
+                        attempts = attempts,
+                    ),
+                )
+            }
+            if (scanType == "checkin" && !scanValue.isNullOrBlank()) {
+                attempts += scanAttempt.copy(ok = true, message = "app/scan 校验通过 (lessonId=$scanValue)")
+                val discoveredContext = LessonContext(lessonId = scanValue, classroomId = scanClassroomId)
+
+                val checkinEndpoint = profile.endpoint("checkinAppScan")
+                val checkinVars = Template.varsOf("lessonId" to scanValue)
+                val checkinBase = "${currentRef.account.scheme}://${currentRef.account.host}"
+                val checkinUrl = api.buildUrl(
+                    checkinBase,
+                    Template.renderPath(checkinEndpoint.path, checkinVars),
+                    Template.renderMap(checkinEndpoint.query, checkinVars),
+                )
+                val checkinReqBody = checkinEndpoint.body?.let { Template.renderBody(it, checkinVars) }
+
+                val checkinRes = api.call(
+                    account = currentRef.account,
+                    endpointName = "checkinAppScan",
+                    vars = checkinVars,
+                )
+                val checkinMsg = resolveAttemptMessage(checkinRes)
+                val rawCheckinAttempt = StrategyAttempt(
+                    strategy = APP_SCAN_STRATEGY_ID,
+                    httpStatus = checkinRes.httpStatus,
+                    code = checkinRes.code,
+                    message = checkinMsg,
+                    ok = checkinRes.ok,
+                    requestLine = "${checkinEndpoint.method} $checkinUrl",
+                    requestBody = checkinReqBody?.toString(),
+                    responseBody = checkinRes.body.take(2000),
+                    elapsedMs = checkinRes.elapsedMs,
+                )
+                val step2State = classify(rawCheckinAttempt)
+                val step2Ok = step2State == SignState.SUCCESS || step2State == SignState.ALREADY
+                val step2Attempt = rawCheckinAttempt.copy(ok = step2Ok)
+                attempts += step2Attempt
+                applyAuthUpdateIfChanged(currentRef, checkinRes.auth, markOk = step2Ok)
+
+                if (step2Ok) {
+                    val defaultMsg = if (step2State == SignState.ALREADY) "已签到" else "签到成功"
+                    return AppScanOutcome.Terminal(
+                        SignResult(
+                            accountId = currentRef.account.id,
+                            label = currentRef.account.label,
+                            state = step2State,
+                            message = step2Attempt.message?.takeIf { it.isNotBlank() } ?: defaultMsg,
+                            strategy = APP_SCAN_STRATEGY_ID,
+                            lessonId = scanValue,
+                            attempts = attempts,
+                        ),
+                    )
+                }
+                if (step2State == SignState.AUTH_REQUIRED) {
+                    return AppScanOutcome.Terminal(
+                        SignResult(
+                            accountId = currentRef.account.id,
+                            label = currentRef.account.label,
+                            state = SignState.AUTH_REQUIRED,
+                            message = step2Attempt.message?.takeIf { it.isNotBlank() } ?: "签到鉴权失败",
+                            strategy = APP_SCAN_STRATEGY_ID,
+                            lessonId = scanValue,
+                            attempts = attempts,
+                        ),
+                    )
+                }
+                if (step2State == SignState.TICKET_EXPIRED && options.stopWhenTicketExpired) {
+                    return AppScanOutcome.Terminal(
+                        SignResult(
+                            accountId = currentRef.account.id,
+                            label = currentRef.account.label,
+                            state = SignState.TICKET_EXPIRED,
+                            message = step2Attempt.message?.takeIf { it.isNotBlank() } ?: "二维码已过期",
+                            strategy = APP_SCAN_STRATEGY_ID,
+                            lessonId = scanValue,
+                            attempts = attempts,
+                        ),
+                    )
+                }
+                return AppScanOutcome.Fallthrough(
+                    discoveredContext = discoveredContext,
+                    bestFailure = step2Attempt to step2State,
+                )
+            }
+        }
+
+        if (scanRes.code == 51203) {
+            val expiredMsg = scanRes.message?.takeIf { it.isNotBlank() } ?: "二维码无效或已过期（51203）"
+            val updatedAttempt = scanAttempt.copy(message = expiredMsg)
+            attempts += updatedAttempt
+            if (options.stopWhenTicketExpired && matchesAnyKeyword(expiredMsg, APP_SCAN_EXPIRED_KEYWORDS)) {
+                return AppScanOutcome.Terminal(
+                    SignResult(
+                        accountId = currentRef.account.id,
+                        label = currentRef.account.label,
+                        state = SignState.TICKET_EXPIRED,
+                        message = expiredMsg,
+                        strategy = APP_SCAN_STRATEGY_ID,
+                        lessonId = ticket.lessonId,
+                        attempts = attempts,
+                    ),
+                )
+            }
+            return AppScanOutcome.Fallthrough(
+                discoveredContext = null,
+                bestFailure = updatedAttempt to SignState.FAILED,
+            )
+        }
+
+        // HTTP 404/405/5xx、网络异常或旧模拟服务未实现 /api/v3/app/scan：记录轨迹并安全回退
+        attempts += scanAttempt
+        return AppScanOutcome.Fallthrough(discoveredContext = null, bestFailure = null)
     }
 
     // ---------------------------------------------------------------- 单策略执行
@@ -376,7 +654,8 @@ class SignInEngine(
         val path = Template.renderPath(endpoint.path, vars)
         val url = api.buildUrl(base, path, Template.renderMap(endpoint.query, vars))
         val body = endpoint.body?.let { Template.renderBody(it, vars) }
-        return PlanBuildResult.Ready(RequestPlan(endpoint.method, url, body))
+        val headers = Template.renderMap(endpoint.headers, vars)
+        return PlanBuildResult.Ready(RequestPlan(endpoint.method, url, body, headers))
     }
 
     private fun simulateDryRun(
@@ -426,7 +705,11 @@ class SignInEngine(
         while (attemptIndex < options.maxAttemptsPerStrategy) {
             val activeAccount = currentRef.account
             val base = "${activeAccount.scheme}://${activeAccount.host}"
-            val referer = context?.classroomId?.let { "$base/v2/web/studentLog/$it" } ?: "$base/v2/web/index"
+            val referer = if (isQrUrlStrategy(spec.id)) {
+                extractOrigin(plan.url)?.let { "$it/v2/web/index" } ?: "$base/v2/web/index"
+            } else {
+                context?.classroomId?.let { "$base/v2/web/studentLog/$it" } ?: "$base/v2/web/index"
+            }
 
             val result = api.raw(
                 account = activeAccount,
@@ -434,14 +717,15 @@ class SignInEngine(
                 url = plan.url,
                 body = plan.body,
                 referer = referer,
+                extraHeaders = plan.headers,
             )
 
             val rawAttempt = StrategyAttempt(
                 strategy = spec.id,
                 httpStatus = result.httpStatus,
                 code = result.code,
-                message = result.message ?: result.body.take(160),
-                ok = false,
+                message = resolveAttemptMessage(result),
+                ok = result.ok,
                 requestLine = "${plan.method} ${plan.url}",
                 requestBody = plan.body?.toString(),
                 responseBody = result.body.take(2000),
@@ -500,50 +784,156 @@ class SignInEngine(
         ticket: QrTicket,
         spec: StrategySpec,
     ): Map<String, JsonElement> = buildMap {
-        context?.lessonId?.let { put("lessonId", JsonPrimitive(it)) }
-        context?.classroomId?.let { put("classroomId", JsonPrimitive(it)) }
-        ticket.checkinId?.let { put("checkinId", JsonPrimitive(it)) }
-        ticket.params.forEach { (k, v) -> put(k, JsonPrimitive(v)) }
+        ticket.params.forEach { (k, v) ->
+            if (v.isNotBlank()) put(k, JsonPrimitive(v))
+        }
+        context?.lessonId?.takeIf { it.isNotBlank() }?.let { put("lessonId", JsonPrimitive(it)) }
+        context?.classroomId?.takeIf { it.isNotBlank() }?.let { put("classroomId", JsonPrimitive(it)) }
+        ticket.checkinId?.takeIf { it.isNotBlank() }?.let { put("checkinId", JsonPrimitive(it)) }
+        put("qrRaw", JsonPrimitive(ticket.raw))
         account.userId?.let { put("userId", JsonPrimitive(it)) }
         spec.vars.forEach { (k, v) -> put(k, v) }
     }
 
     /**
-     * 统一状态分类器（严格优先级）：
+     * 统一状态分类器（严格优先级，与 iOS `CheckInOrchestrator` 对齐）：
      *  1. 网络异常 (`httpStatus == -1`) -> [SignState.ERROR]（绝不误判为 AUTH_REQUIRED）
-     *  2. HTTP 401/403 -> [SignState.AUTH_REQUIRED]（优先于 alreadyKeywords）
+     *  2. HTTP 401 -> [SignState.AUTH_REQUIRED]（优先于 alreadyKeywords）
      *  3. 非 401/403/5xx 响应命中 `alreadyKeywords` -> [SignState.ALREADY]（优先于 `okCodes`！）
-     *  4. HTTP 2xx 且 `code in okCodes` -> [SignState.SUCCESS]
-     *  5. 命中 `authKeywords`（大小写不敏感，含 HTTP 200 业务鉴权失败）-> [SignState.AUTH_REQUIRED]
-     *  6. 命中 `expiredKeywords`（大小写不敏感）-> [SignState.TICKET_EXPIRED]
-     *  7. 可重试状态码 / 5xx -> [SignState.ERROR]
-     *  8. 其他 -> [SignState.FAILED]
+     *  4. HTTP 2xx 且 `code in okCodes`（或 `{"success": true}`）-> [SignState.SUCCESS]
+     *  5. `code == 401` -> [SignState.AUTH_REQUIRED]
+     *  6. IPA 1.3.6 官方实证业务码优先归类（`50019/50015/50017/50004/50021/50023/50003/50070/51203`），
+     *     防止 `50019`「学校身份」命中 `authKeywords` 误判登录过期，或 `50070` 命中 `expiredKeywords` 过早截断兜底
+     *  7. HTTP 403 若非非鉴权业务拒绝体则判 [SignState.AUTH_REQUIRED]
+     *  8. 非 HTML 响应命中 `authKeywords`（大小写不敏感，含 HTTP 200 业务鉴权失败）-> [SignState.AUTH_REQUIRED]
+     *  9. 非 404 路由缺失响应命中 `expiredKeywords`（大小写不敏感）-> [SignState.TICKET_EXPIRED]
+     * 10. 可重试状态码 / 5xx -> [SignState.ERROR]
+     * 11. 其他 -> [SignState.FAILED]
      */
     internal fun classify(attempt: StrategyAttempt): SignState {
         val status = attempt.httpStatus
         if (status == -1) return SignState.ERROR
-        if (status == 401 || status == 403) return SignState.AUTH_REQUIRED
+        if (status == 401) return SignState.AUTH_REQUIRED
 
-        val text = attempt.message?.takeIf { it.isNotBlank() } ?: attempt.responseBody.orEmpty()
+        val rawText = attempt.message?.takeIf { it.isNotBlank() } ?: attempt.responseBody.orEmpty()
+        val nonHtmlText = if (isHtmlBody(rawText)) "" else rawText
         val isServerOrRetryableError = status != null &&
             (status >= 500 || profile.result.retryHttpStatus.contains(status))
 
-        if (status != null && !isServerOrRetryableError && matchesAnyKeyword(text, profile.result.alreadyKeywords)) {
+        if (status != null && status != 403 && !isServerOrRetryableError &&
+            matchesAnyKeyword(nonHtmlText, profile.result.alreadyKeywords)
+        ) {
             return SignState.ALREADY
         }
-        if (status != null && status in 200..299 && profile.result.isOkCode(attempt.code)) {
+        if (status != null && status in 200..299 && (profile.result.isOkCode(attempt.code) || attempt.ok)) {
             return SignState.SUCCESS
         }
-        if (matchesAnyKeyword(text, profile.result.authKeywords)) {
+        if (attempt.code == 401) {
             return SignState.AUTH_REQUIRED
         }
-        if (matchesAnyKeyword(text, profile.result.expiredKeywords)) {
+
+        // 官方雨课堂 1.3.6 实证业务码优先归类（与 iOS CheckInOrchestrator 保持一致）
+        when (attempt.code) {
+            50019, 50015, 50017, 50004, 50021, 50023, 50003 -> return SignState.FAILED
+            50070 -> return SignState.FAILED
+            51203 -> {
+                return if (matchesAnyKeyword(nonHtmlText, APP_SCAN_EXPIRED_KEYWORDS)) {
+                    SignState.TICKET_EXPIRED
+                } else {
+                    SignState.FAILED
+                }
+            }
+        }
+
+        if (status == 403) {
+            val isNonAuthBusinessRejection = attempt.code != null &&
+                attempt.code != 40100 &&
+                attempt.code != 40301 &&
+                !matchesAnyKeyword(nonHtmlText, profile.result.authKeywords + listOf("csrf", "forbidden"))
+            if (!isNonAuthBusinessRejection) {
+                return SignState.AUTH_REQUIRED
+            }
+        }
+
+        if (matchesAnyKeyword(nonHtmlText, profile.result.authKeywords)) {
+            return SignState.AUTH_REQUIRED
+        }
+        val isNotFoundRoute = status == 404 && (
+            rawText.isBlank() ||
+                isHtmlBody(rawText) ||
+                rawText.contains("接口不存在", ignoreCase = true) ||
+                rawText.contains("未知路径", ignoreCase = true) ||
+                rawText.contains("not found", ignoreCase = true)
+        )
+        if (!isNotFoundRoute && matchesAnyKeyword(nonHtmlText, profile.result.expiredKeywords)) {
             return SignState.TICKET_EXPIRED
         }
         if (isServerOrRetryableError) {
             return SignState.ERROR
         }
         return SignState.FAILED
+    }
+
+    private fun resolveAttemptMessage(result: ApiResult): String {
+        val direct = result.message?.takeIf { it.isNotBlank() }
+        if (direct != null) return direct
+        val mapped = officialErrorMessage(result.code)
+        if (mapped != null) return mapped
+        val trimmedBody = result.body.trim()
+        if (trimmedBody.isEmpty()) {
+            return if (result.httpStatus > 0) "HTTP ${result.httpStatus}（空响应）" else "网络异常"
+        }
+        if (isHtmlBody(trimmedBody)) {
+            return "服务器返回 HTML 页面（HTTP ${result.httpStatus}）"
+        }
+        return trimmedBody.take(160)
+    }
+
+    private fun officialErrorMessage(code: Int?): String? = when (code) {
+        51203 -> "二维码无效或已过期（51203）"
+        50070 -> "动态二维码校验未通过或课堂已结束（50070）"
+        50019, 50015 -> "账号未绑定学校身份（$code）"
+        50017 -> "教师已设置入班限制（50017）"
+        50004 -> "课堂已结束，无法签到（50004）"
+        50021 -> "课堂人数已达上限（50021）"
+        50023, 50003 -> "课堂或签到码不存在（$code）"
+        else -> null
+    }
+
+    private fun isMoreInformativeFailure(candidate: StrategyAttempt, existing: StrategyAttempt?): Boolean {
+        if (existing == null) return true
+        return failureInformativeScore(candidate) > failureInformativeScore(existing)
+    }
+
+    private fun failureInformativeScore(attempt: StrategyAttempt): Int {
+        val status = attempt.httpStatus ?: return 1
+        if (status == -1) return 2
+        if (status == 404 || status == 405) return 2
+        val msg = attempt.message.orEmpty()
+        if (msg.isBlank() || isHtmlBody(msg) || msg.startsWith("服务器返回 HTML")) return 3
+        var score = 4
+        if (attempt.code != null) score += 2
+        if (attempt.code in OFFICIAL_NON_AUTH_CODES) score += 3
+        return score
+    }
+
+    private fun isHtmlBody(text: String): Boolean {
+        val trimmed = text.trimStart()
+        return trimmed.startsWith("<!DOCTYPE", ignoreCase = true) ||
+            trimmed.startsWith("<html", ignoreCase = true) ||
+            trimmed.startsWith("<head", ignoreCase = true) ||
+            trimmed.startsWith("<body", ignoreCase = true)
+    }
+
+    private fun extractOrigin(url: String): String? {
+        val scheme = QrParser.extractScheme(url) ?: return null
+        val host = QrParser.extractHost(url) ?: return null
+        val normalizedHost = when {
+            scheme == "https" && host.endsWith(":443") -> host.removeSuffix(":443")
+            scheme == "http" && host.endsWith(":80") -> host.removeSuffix(":80")
+            else -> host
+        }
+        return "$scheme://$normalizedHost"
     }
 
     private fun matchesAnyKeyword(text: String, keywords: List<String>): Boolean {
@@ -556,32 +946,67 @@ class SignInEngine(
 
     // ---------------------------------------------------------------- 解析辅助
 
+    private fun extractLessonsFromResponse(active: ApiResult): List<LessonContext> {
+        val dataObj = active.data()
+        if (dataObj != null) {
+            val fromData = findLessonObjects(dataObj)
+            if (fromData.isNotEmpty()) return fromData
+        }
+        val root = active.json
+        if (root != null) {
+            val fromRoot = findLessonObjects(root)
+            if (fromRoot.isNotEmpty()) return fromRoot
+            val dataArr = root["data"] as? JsonArray
+            if (dataArr != null) {
+                val fromArr = parseLessonArray(dataArr)
+                if (fromArr.isNotEmpty()) return fromArr
+            }
+        }
+        return emptyList()
+    }
+
     private fun findLessonObjects(data: JsonObject): List<LessonContext> {
         val arrays = listOf("onLessonClassrooms", "classrooms", "lessonList", "lessons")
         for (key in arrays) {
             val array = data[key] as? JsonArray ?: continue
-            val parsed = array.mapNotNull { element ->
-                val obj = element as? JsonObject ?: return@mapNotNull null
-                val lessonId = obj.firstNonBlankString("lessonId", "lesson_id", "id", "courseId")
-                if (lessonId.isNullOrBlank()) return@mapNotNull null
-                LessonContext(
-                    lessonId = lessonId,
-                    classroomId = obj.firstNonBlankString("classroomId", "classroom_id"),
-                    name = obj.firstNonBlankString("courseName", "lessonName", "name", "title"),
-                )
-            }
+            val parsed = parseLessonArray(array)
             if (parsed.isNotEmpty()) return parsed
         }
         return emptyList()
     }
 
+    private fun parseLessonArray(array: JsonArray): List<LessonContext> =
+        array.mapNotNull { element ->
+            val obj = element as? JsonObject ?: return@mapNotNull null
+            val lessonId = obj.firstNonBlankString("lessonId", "lesson_id", "id", "courseId")
+            if (lessonId.isNullOrBlank()) return@mapNotNull null
+            LessonContext(
+                lessonId = lessonId,
+                classroomId = obj.firstNonBlankString("classroomId", "classroom_id"),
+                name = obj.firstNonBlankString("courseName", "lessonName", "name", "title"),
+            )
+        }
+
     private class AccountRef(var account: Account)
 
-    private data class RequestPlan(val method: String, val url: String, val body: JsonObject?)
+    private data class RequestPlan(
+        val method: String,
+        val url: String,
+        val body: JsonObject?,
+        val headers: Map<String, String> = emptyMap(),
+    )
 
     private sealed class PlanBuildResult {
         data class Ready(val plan: RequestPlan) : PlanBuildResult()
         data class Rejected(val reason: String) : PlanBuildResult()
+    }
+
+    private sealed class AppScanOutcome {
+        data class Terminal(val result: SignResult) : AppScanOutcome()
+        data class Fallthrough(
+            val discoveredContext: LessonContext?,
+            val bestFailure: Pair<StrategyAttempt, SignState>?,
+        ) : AppScanOutcome()
     }
 
     private sealed class DiscoverOutcome {
@@ -589,5 +1014,11 @@ class SignInEngine(
         data class AuthRequired(val message: String, val attempt: StrategyAttempt) : DiscoverOutcome()
         data class NetworkError(val message: String, val attempt: StrategyAttempt) : DiscoverOutcome()
         data class NotFound(val message: String, val attempt: StrategyAttempt?) : DiscoverOutcome()
+    }
+
+    private companion object {
+        const val APP_SCAN_STRATEGY_ID = "APP_SCAN_CHECKIN"
+        val OFFICIAL_NON_AUTH_CODES = setOf(51203, 50070, 50019, 50015, 50017, 50004, 50021, 50023, 50003)
+        val APP_SCAN_EXPIRED_KEYWORDS = listOf("过期", "失效", "expired", "refused", "二维码已")
     }
 }

@@ -5,8 +5,9 @@
   1. 登录：扫码登录（pre-info / wait-for-scan / login / login-with-code）与
      Web 手机短信登录（/pc/login/send_sms_login_code/、/pc/login/verify_pwd_login/）及 basic-info
   2. 课堂上下文：on-lesson-upcoming-exam / checkin-list / checkin/detail / lesson/basic-info
-  3. 签到：lesson/checkin（支持静态码、动态 ticket/t/s 强校验、source=14 拒绝回退、
-     重复签到、过期码、双载体 Bearer + Cookie/CSRF 鉴权、响应头会话刷新）
+  3. 签到：app/scan（官方 IPA 1.3.6 扫码解析第一步，支持 ScanBean 响应与 51203 过期校验）与
+     lesson/checkin（支持 source=21 + joinIfNotIn=true 官方两步流、静态码、动态 ticket/t/s 强校验、
+     source=14 拒绝回退、重复签到、过期码、双载体 Bearer + Cookie/CSRF 鉴权、响应头会话刷新）
   4. 管理：/admin/reset、/admin/lesson、/admin/ticket、/admin/qr、/admin/scan、
      /admin/attend、/admin/state
 
@@ -98,6 +99,7 @@ class World:
         self.verify_tokens: dict[str, str] = {}             # verify_token -> login_token
         self.sms_codes: dict[str, dict[str, Any]] = {}      # mobile -> sms code state
         self.attendance: dict[str, dict[str, Any]] = {}     # uid -> record
+        self.scanned_authorizations: dict[tuple[str, str], float] = {}  # (uid, lessonId) -> expire_ts
 
         self.requests: list[dict[str, Any]] = []
         self.total_requests = 0
@@ -142,6 +144,7 @@ class World:
         }
         return {
             "qr": f"c={code}&t={ts}&s={sig}&v=2",
+            "url": f"http://127.0.0.1:8787/api/v3/lesson/check-in/dynamic-qr-code?c={code}&t={ts}&s={sig}&v=2",
             "c": code,
             "t": ts,
             "s": sig,
@@ -417,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._login_poll(body)
             if path == "/api/v3/user/login/login-with-code":
                 return self._login_code(body)
+            if path == "/api/v3/app/scan":
+                return self._app_scan(body)
             if path == "/api/v3/lesson/checkin":
                 return self._checkin(body)
             if path == "/api/v3/lesson/checkin-list":
@@ -739,6 +744,106 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ 签到
 
+    def _app_scan(self, body: dict[str, Any]) -> None:
+        """官方 IPA 1.3.6 扫码第一步：POST /api/v3/app/scan {"url": rawQr} -> ScanBean。"""
+        user, _, err, status = self._authenticate(require_csrf=True)
+        if user is None:
+            return self._fail(40100 if status == 401 else 40301, err or "未登录", status=status)
+
+        raw_url = str(body.get("url") or "").strip()
+        if not raw_url:
+            return self._fail(51203, "二维码内容为空")
+
+        parsed = urlparse(raw_url) if "://" in raw_url else urlparse(f"https://mock.local/?{raw_url.lstrip('?&')}")
+        path_lower = (parsed.path or "").lower()
+        qs = parse_qs(parsed.query)
+
+        if "qrconnect" in path_lower or "/user/login" in path_lower:
+            scene = (qs.get("state") or qs.get("scene") or ["mock-login-scene"])[0]
+            return self._ok(
+                {
+                    "type": "login",
+                    "value": scene,
+                    "title": "",
+                    "code": "",
+                    "lesson_id": "",
+                    "is_teacher": False,
+                    "classroom_id": "",
+                    "course_id": "",
+                    "classroom_name": "",
+                },
+                msg="ok",
+            )
+
+        ticket_code = (qs.get("c") or [""])[0].strip()
+        ts_val = (qs.get("t") or [""])[0].strip()
+        sig_val = (qs.get("s") or [""])[0].strip()
+        lesson_param = (
+            (qs.get("lessonId") or qs.get("lesson_id") or qs.get("lid") or [""])[0].strip()
+            or (raw_url if raw_url.isdigit() else "")
+        )
+        classroom_param = (qs.get("classroomId") or qs.get("classroom_id") or qs.get("cid") or [""])[0].strip()
+
+        resolved_lesson = ""
+        resolved_classroom = WORLD.classroom_id
+        if ticket_code:
+            ticket = WORLD.tickets.get(ticket_code)
+            if ticket is None:
+                if "expired" in ticket_code.lower():
+                    return self._fail(51203, "二维码已过期")
+                if WORLD.require_ticket:
+                    return self._fail(51203, "动态二维码无效或已过期")
+                resolved_lesson = lesson_param or WORLD.lesson_id
+            else:
+                if time.time() - float(ticket["issued"]) > float(ticket["ttl"]):
+                    return self._fail(51203, "二维码已过期")
+                if (ts_val and ts_val != ticket["t"]) or (sig_val and sig_val != ticket["s"]):
+                    return self._fail(51203, "动态二维码签名校验失败")
+                if WORLD.require_ticket and (ts_val != ticket["t"] or sig_val != ticket["s"]):
+                    return self._fail(51203, "动态二维码签名校验失败")
+                resolved_lesson = str(ticket["lessonId"])
+                resolved_classroom = str(ticket["classroomId"])
+        elif lesson_param:
+            if lesson_param != WORLD.lesson_id:
+                return self._fail(51203, "课堂不存在")
+            resolved_lesson = lesson_param
+            resolved_classroom = classroom_param or WORLD.classroom_id
+        elif classroom_param:
+            return self._ok(
+                {
+                    "type": "classroom",
+                    "value": classroom_param,
+                    "title": WORLD.lesson_name,
+                    "code": "",
+                    "lesson_id": "",
+                    "is_teacher": False,
+                    "classroom_id": classroom_param,
+                    "course_id": "",
+                    "classroom_name": WORLD.lesson_name,
+                },
+                msg="ok",
+            )
+        else:
+            return self._fail(51203, "雨课堂无法识别其他二维码")
+
+        WORLD.scanned_authorizations[(user["id"], resolved_lesson)] = time.time() + 30.0
+        refresh_headers = WORLD.issue_refreshed_session(user) if WORLD.refresh_session else None
+        return self._ok(
+            {
+                "type": "checkin",
+                "value": resolved_lesson,
+                "lesson_id": resolved_lesson,
+                "title": WORLD.lesson_name,
+                "code": "",
+                "is_teacher": False,
+                "classroom_id": resolved_classroom,
+                "course_id": "",
+                "classroom_name": WORLD.lesson_name,
+            },
+            msg="ok",
+            headers=refresh_headers,
+        )
+
     def _checkin(self, body: dict[str, Any]) -> None:
         user, auth_mode, err, status = self._authenticate(require_csrf=True)
         if user is None:
@@ -760,8 +865,14 @@ class Handler(BaseHTTPRequestHandler):
         ticket_code = str(body.get("ticket") or "").strip()
         ts_val = str(body.get("t") or "").strip()
         signature = str(body.get("s") or "").strip()
+        join_if_not_in = bool(body.get("joinIfNotIn", False))
+        scan_auth_exp = WORLD.scanned_authorizations.get((user["id"], lesson_id), 0.0)
+        has_valid_app_scan = source == 21 and scan_auth_exp >= time.time()
 
-        if WORLD.require_ticket:
+        if WORLD.require_ticket and not has_valid_app_scan:
+            if source == 21:
+                WORLD.checkin_stats["rejected"] += 1
+                return self._fail(50070, "DYNAMIC QR CHECK IN REFUSED")
             if not ticket_code or not ts_val or not signature:
                 WORLD.checkin_stats["rejected"] += 1
                 return self._fail(40002, "动态签到必须同时提供完整的 ticket/t/s 参数")
@@ -784,19 +895,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if user["id"] in WORLD.attendance:
             WORLD.checkin_stats["already"] += 1
-            return self._ok({"signed": True, "already": True}, msg="已签到", headers=refresh_headers)
+            return self._ok(
+                {"signed": True, "already": True, "lessonId": lesson_id, "role": 3},
+                msg="已签到",
+                headers=refresh_headers,
+            )
 
         WORLD.attendance[user["id"]] = {
             "user": user["id"],
             "name": user["name"],
             "at": time.time(),
-            "via": "ticket" if ticket_code else "lesson",
+            "via": "app_scan" if has_valid_app_scan else ("ticket" if ticket_code else "lesson"),
             "source": source,
+            "joinIfNotIn": join_if_not_in,
             "authMode": auth_mode,
             "lessonId": lesson_id,
         }
         WORLD.checkin_stats["accepted"] += 1
-        return self._ok({"signed": True}, msg="签到成功", headers=refresh_headers)
+        return self._ok(
+            {"signed": True, "lessonId": lesson_id, "role": 3, "joinIfNotIn": join_if_not_in},
+            msg="签到成功",
+            headers=refresh_headers,
+        )
 
     # ------------------------------------------------------------------ 管理
 
