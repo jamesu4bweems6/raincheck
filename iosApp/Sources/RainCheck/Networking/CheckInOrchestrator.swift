@@ -11,6 +11,7 @@ struct LessonContext: Hashable, Sendable {
 /// 多账号多策略签到编排引擎（优先执行 IPA 1.3.6 官方两步扫码签到，保留完整兜底策略与安全护栏）。
 final class CheckInOrchestrator: Sendable {
     static let appScanStrategyId = "APP_SCAN_CHECKIN"
+    static let appScanWebStrategyId = "APP_SCAN_CHECKIN_WEB"
 
     let client: RainCheckClient
     let profile: ProtocolProfile
@@ -907,28 +908,21 @@ final class CheckInOrchestrator: Sendable {
         let scanState = step1Call.state
         let scanDiagMsg = mapServerDiagnosticMessage(for: scanResult)
 
-        // 1) 鉴权过期：立即中止
+        // 1) Step 1 在 x-client: app 下返回鉴权失败：不直接误杀仅持有 Web sessionid 的有效账号，
+        // 交由后续 X-Client: web 的课堂发现与兜底策略验证（若 Web 会话同样过期，首条 Web 请求会立即中止为 .authExpired）
         if scanState == .authExpired {
-            return .terminal(
-                SignResult(
-                    accountId: account.id,
-                    accountLabel: account.label,
-                    host: account.host,
+            updateBestFailure(
+                &bestAppFailure,
+                with: FailureCandidate(
+                    priority: 140,
                     state: .authExpired,
                     strategyId: Self.appScanStrategyId,
                     httpStatus: scanResult.httpStatus,
                     businessCode: scanResult.businessCode,
-                    message: appendHostMismatchHintIfNeeded(
-                        message: scanDiagMsg,
-                        account: account,
-                        ticket: ticket
-                    ),
-                    elapsedMs: max(0, RainCheckTime.nowMillis() - startedMs),
-                    attempts: existingTraces + localTraces,
-                    timestampMs: RainCheckTime.nowMillis(),
-                    refreshedAccount: credentialsRefreshed ? account : nil
+                    message: scanDiagMsg
                 )
             )
+            return .fallback(discoveredContext: nil, bestFailure: bestAppFailure, traces: localTraces)
         }
 
         // 2) 旧版服务/本地演练未实现 /api/v3/app/scan（404 / 405）：记录低优先级轨迹并无缝回退
@@ -1094,14 +1088,51 @@ final class CheckInOrchestrator: Sendable {
                 )
                 localTraces.append(contentsOf: step2Call.traces)
 
-                if let terminal = evaluateAppScanStep2(
+                if step2Call.state == .authExpired && !Task.isCancelled {
+                    // 实网修复：Web PC 手机号登录或浏览器导入的 sessionid 在 x-client: app 下会被 /api/v3/lesson/checkin
+                    // 拒签返回 HTTP 200 code 50000 UNAUTHENTICATED（而 X-Client: web 的 basic-info 凭据校验有效）。
+                    // 立即以与 basic-info 一致的 X-Client: web 请求头重试同载荷；若仍未通过则继续复用已发现的 lessonId 走 Web 兜底链。
+                    let base = "\(account.scheme)://\(account.host)"
+                    let webReferer: String
+                    if let cid = discoveredContext.classroomId, !cid.isEmpty {
+                        webReferer = "\(base)/v2/web/studentLog/\(cid)"
+                    } else {
+                        webReferer = "\(base)/v2/web/index"
+                    }
+                    let webRetryCall = await callEndpointForAppScan(
+                        endpointKey: "checkinAppScan",
+                        variables: ["lessonId": .string(value)],
+                        strategyId: Self.appScanWebStrategyId,
+                        referer: webReferer,
+                        extraHeaders: ["X-Client": "web"],
+                        markOkOnSuccess: true,
+                        account: &account,
+                        credentialsRefreshed: &credentialsRefreshed
+                    )
+                    localTraces.append(contentsOf: webRetryCall.traces)
+
+                    if let terminal = evaluateAppScanStep2(
+                        call: webRetryCall,
+                        strategyId: Self.appScanWebStrategyId,
+                        ticket: ticket,
+                        startedMs: startedMs,
+                        account: account,
+                        credentialsRefreshed: credentialsRefreshed,
+                        allTraces: existingTraces + localTraces,
+                        bestFailure: &bestAppFailure,
+                        abortOnAuthExpired: false
+                    ) {
+                        return .terminal(terminal)
+                    }
+                } else if let terminal = evaluateAppScanStep2(
                     call: step2Call,
                     ticket: ticket,
                     startedMs: startedMs,
                     account: account,
                     credentialsRefreshed: credentialsRefreshed,
                     allTraces: existingTraces + localTraces,
-                    bestFailure: &bestAppFailure
+                    bestFailure: &bestAppFailure,
+                    abortOnAuthExpired: true
                 ) {
                     return .terminal(terminal)
                 }
@@ -1124,7 +1155,8 @@ final class CheckInOrchestrator: Sendable {
                         account: account,
                         credentialsRefreshed: credentialsRefreshed,
                         allTraces: existingTraces + localTraces,
-                        bestFailure: &bestAppFailure
+                        bestFailure: &bestAppFailure,
+                        abortOnAuthExpired: true
                     ) {
                         return .terminal(terminal)
                     }
@@ -1188,12 +1220,14 @@ final class CheckInOrchestrator: Sendable {
 
     private func evaluateAppScanStep2(
         call: (result: ApiCallResult, state: SignState, traces: [AttemptTrace]),
+        strategyId: String = CheckInOrchestrator.appScanStrategyId,
         ticket: QrTicket,
         startedMs: Int64,
         account: Account,
         credentialsRefreshed: Bool,
         allTraces: [AttemptTrace],
-        bestFailure: inout FailureCandidate?
+        bestFailure: inout FailureCandidate?,
+        abortOnAuthExpired: Bool = true
     ) -> SignResult? {
         if Task.isCancelled {
             return SignResult(
@@ -1201,7 +1235,7 @@ final class CheckInOrchestrator: Sendable {
                 accountLabel: account.label,
                 host: account.host,
                 state: .failed,
-                strategyId: Self.appScanStrategyId,
+                strategyId: strategyId,
                 httpStatus: call.result.httpStatus,
                 businessCode: call.result.businessCode,
                 message: "签到任务已取消",
@@ -1224,7 +1258,7 @@ final class CheckInOrchestrator: Sendable {
                 accountLabel: account.label,
                 host: account.host,
                 state: state,
-                strategyId: Self.appScanStrategyId,
+                strategyId: strategyId,
                 httpStatus: res.httpStatus,
                 businessCode: res.businessCode,
                 message: rawMsg.isEmpty ? defaultMsg : rawMsg,
@@ -1235,13 +1269,13 @@ final class CheckInOrchestrator: Sendable {
             )
         }
 
-        if state == .authExpired {
+        if state == .authExpired && abortOnAuthExpired {
             return SignResult(
                 accountId: account.id,
                 accountLabel: account.label,
                 host: account.host,
                 state: .authExpired,
-                strategyId: Self.appScanStrategyId,
+                strategyId: strategyId,
                 httpStatus: res.httpStatus,
                 businessCode: res.businessCode,
                 message: appendHostMismatchHintIfNeeded(
@@ -1262,7 +1296,7 @@ final class CheckInOrchestrator: Sendable {
                 accountLabel: account.label,
                 host: account.host,
                 state: .qrExpired,
-                strategyId: Self.appScanStrategyId,
+                strategyId: strategyId,
                 httpStatus: res.httpStatus,
                 businessCode: res.businessCode,
                 message: appendHostMismatchHintIfNeeded(
@@ -1282,14 +1316,14 @@ final class CheckInOrchestrator: Sendable {
             with: FailureCandidate(
                 priority: failurePriority(
                     state: state,
-                    strategyId: Self.appScanStrategyId,
+                    strategyId: strategyId,
                     httpStatus: res.httpStatus,
                     businessCode: res.businessCode,
                     isHtmlBody: res.isHtmlBody,
                     hasJsonMessage: !(res.message?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
                 ),
                 state: state,
-                strategyId: Self.appScanStrategyId,
+                strategyId: strategyId,
                 httpStatus: res.httpStatus,
                 businessCode: res.businessCode,
                 message: diagMsg
@@ -1301,6 +1335,9 @@ final class CheckInOrchestrator: Sendable {
     private func callEndpointForAppScan(
         endpointKey: String,
         variables: [String: TemplateValue],
+        strategyId: String = CheckInOrchestrator.appScanStrategyId,
+        referer: String? = nil,
+        extraHeaders: [String: String] = [:],
         markOkOnSuccess: Bool,
         account: inout Account,
         credentialsRefreshed: inout Bool
@@ -1323,8 +1360,8 @@ final class CheckInOrchestrator: Sendable {
                 account: account,
                 variables: variables,
                 extraCookies: [:],
-                referer: nil,
-                extraHeaders: [:]
+                referer: referer,
+                extraHeaders: extraHeaders
             )
             let initialState = classify(
                 httpStatus: initialResult.httpStatus,
@@ -1335,7 +1372,7 @@ final class CheckInOrchestrator: Sendable {
                 jsonSuccess: initialResult.jsonSuccess
             )
             let initialIsOk = (initialState == .success || initialState == .already)
-            recorded.append(makeTrace(strategyId: Self.appScanStrategyId, result: initialResult))
+            recorded.append(makeTrace(strategyId: strategyId, result: initialResult))
 
             var effectiveResult = initialResult
             var effectiveState = initialState
@@ -1354,8 +1391,8 @@ final class CheckInOrchestrator: Sendable {
                     account: cookieOnlyAccount,
                     variables: variables,
                     extraCookies: [:],
-                    referer: nil,
-                    extraHeaders: [:]
+                    referer: referer,
+                    extraHeaders: extraHeaders
                 )
                 let retryState = classify(
                     httpStatus: retryResult.httpStatus,
@@ -1366,7 +1403,7 @@ final class CheckInOrchestrator: Sendable {
                     jsonSuccess: retryResult.jsonSuccess
                 )
                 let retryIsOk = (retryState == .success || retryState == .already)
-                recorded.append(makeTrace(strategyId: Self.appScanStrategyId, result: retryResult))
+                recorded.append(makeTrace(strategyId: strategyId, result: retryResult))
 
                 effectiveResult = retryResult
                 effectiveState = retryState
@@ -1851,6 +1888,9 @@ final class CheckInOrchestrator: Sendable {
            [51203, 50070, 50019, 50017, 50004, 50021, 50023, 50003, 50015].contains(code) {
             return 400
         }
+        if state == .authExpired {
+            return 380
+        }
         guard let status = httpStatus else {
             return 50 // 本地安全拦截或跳过的策略，绝不能覆盖真实服务端错误
         }
@@ -1864,7 +1904,8 @@ final class CheckInOrchestrator: Sendable {
             return 200
         }
         if businessCode != nil || hasJsonMessage || state == .notInClass {
-            return strategyId == Self.appScanStrategyId ? 360 : 300
+            let isAppScan = (strategyId == Self.appScanStrategyId || strategyId == Self.appScanWebStrategyId)
+            return isAppScan ? 360 : 300
         }
         return 120
     }

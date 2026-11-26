@@ -2375,4 +2375,178 @@ final class CheckInOrchestratorTests: XCTestCase {
         XCTAssertEqual(store.scannerOverlayNotification?.kind, .info)
         XCTAssertEqual(store.scannerOverlayNotification?.succeededLabels, ["先完成账号"])
     }
+
+    func testAppScanStep2UnauthenticatedUnderAppClientRecoversViaWebHeadersAndFallbackStrategies() async throws {
+        struct CapturedHeaderReq: Sendable {
+            let path: String
+            let xClient: String?
+            let sessionHeader: String?
+            let xUid: String?
+            let auth: String?
+            let cookie: String?
+            let source: Int?
+            let lessonId: String?
+        }
+
+        let profile = try TestBundleResources.loadProtocolProfile()
+        let webOnlyAccount = Account(
+            id: "acc-web-cookie-only",
+            label: "Web手机登录账号",
+            host: "www.yuketang.cn",
+            scheme: "https",
+            bearer: nil,
+            sessionId: "web-sid-valid-001",
+            csrfToken: "web-csrf-valid-001",
+            enabled: true,
+            userId: "54321"
+        )
+        let rawQr = "https://www.yuketang.cn/v/index/qr?c=live1&t=1763900000&s=sig1"
+        let ticket = QrCodeParser.parse(rawQr, profile: profile)
+
+        // 1) 复现真实故障：app/scan(x-client: app) 返回 200 code 0 (flow=normal, lessonId=1827403873791691776)，
+        //    step 2a (x-client: app) 返回 HTTP 200 code 50000 UNAUTHENTICATED，
+        //    自动切回 X-Client: web 重试同载荷立即成功且零 discover 调用
+        let capturedA = LockedBox<[CapturedHeaderReq]>([])
+        let discoverCallsA = LockedBox(0)
+        let orchA = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            let xClient = MockNetworkSupport.headerValue("x-client", in: request)
+            let body = MockNetworkSupport.requestBodyJSON(from: request)
+            capturedA.withLock {
+                $0.append(
+                    CapturedHeaderReq(
+                        path: path,
+                        xClient: xClient,
+                        sessionHeader: MockNetworkSupport.headerValue("sessionid", in: request),
+                        xUid: MockNetworkSupport.headerValue("X-UID", in: request),
+                        auth: MockNetworkSupport.headerValue("Authorization", in: request),
+                        cookie: MockNetworkSupport.headerValue("Cookie", in: request),
+                        source: body?["source"]?.intValue,
+                        lessonId: body?["lessonId"]?.stringValue
+                    )
+                )
+            }
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                discoverCallsA.withLock { $0 += 1 }
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            if path == "/api/v3/app/scan" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}"#
+                )
+            }
+            if path == "/api/v3/lesson/checkin" {
+                if xClient?.caseInsensitiveCompare("app") == .orderedSame {
+                    return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+                }
+                if xClient?.caseInsensitiveCompare("web") == .orderedSame {
+                    return .json(200, #"{"code":0,"msg":"签到成功","data":{"lessonId":"1827403873791691776"}}"#)
+                }
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+
+        let resA = await orchA.checkIn(account: webOnlyAccount, ticket: ticket)
+        XCTAssertEqual(resA.state, .success)
+        XCTAssertEqual(resA.strategyId, CheckInOrchestrator.appScanWebStrategyId)
+        XCTAssertEqual(discoverCallsA.get(), 0, "Step 1 已取得 lessonId，不得触发 discoverActiveLesson")
+
+        let reqsA = capturedA.get()
+        XCTAssertEqual(reqsA.count, 3)
+        XCTAssertEqual(reqsA[0].path, "/api/v3/app/scan")
+        XCTAssertEqual(reqsA[0].xClient, "app")
+        XCTAssertEqual(reqsA[0].sessionHeader, "web-sid-valid-001", "x-client: app 应同步附带 sessionid 请求头")
+        XCTAssertEqual(reqsA[0].xUid, "54321")
+        XCTAssertEqual(reqsA[1].path, "/api/v3/lesson/checkin")
+        XCTAssertEqual(reqsA[1].xClient, "app")
+        XCTAssertEqual(reqsA[1].sessionHeader, "web-sid-valid-001")
+        XCTAssertEqual(reqsA[1].source, 21)
+        XCTAssertEqual(reqsA[2].path, "/api/v3/lesson/checkin")
+        XCTAssertEqual(reqsA[2].xClient, "web", "x-client: app 返回 50000 UNAUTHENTICATED 后应以 X-Client: web 重试")
+        XCTAssertNil(reqsA[2].sessionHeader, "X-Client: web 重试不得附带 App 专用 sessionid 请求头")
+        XCTAssertNil(reqsA[2].xUid, "X-Client: web 重试不得附带 App 专用 X-UID 请求头")
+        XCTAssertNil(reqsA[2].auth)
+        XCTAssertTrue(reqsA[2].cookie?.contains("sessionid=web-sid-valid-001") == true)
+        XCTAssertEqual(reqsA[2].source, 21)
+        XCTAssertEqual(reqsA[2].lessonId, "1827403873791691776")
+
+        // 2) 若 source=21 在 app 与 web 均返回 50000 UNAUTHENTICATED，继续复用 lessonId 回退到 LESSON_DESKTOP (X-Client: web, source=1) 成功
+        let opaqueTicket = QrCodeParser.parse("https://www.yuketang.cn/v/index/short-ticket/opaque-qr", profile: profile)
+        XCTAssertEqual(opaqueTicket.kind, .unknown)
+        let discoverCallsB = LockedBox(0)
+        let orchB = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            let xClient = MockNetworkSupport.headerValue("x-client", in: request)
+            let body = MockNetworkSupport.requestBodyJSON(from: request)
+            if path == "/api/v3/classroom/on-lesson-upcoming-exam" {
+                discoverCallsB.withLock { $0 += 1 }
+                return .json(200, #"{"code":0,"data":{"onLessonClassrooms":[]}}"#)
+            }
+            if path == "/api/v3/app/scan" {
+                return .json(
+                    200,
+                    #"{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}"#
+                )
+            }
+            if path == "/api/v3/lesson/checkin" {
+                if body?["source"]?.intValue == 21 {
+                    return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+                }
+                if xClient?.caseInsensitiveCompare("web") == .orderedSame,
+                   body?["source"]?.intValue == 1,
+                   body?["lessonId"]?.stringValue == "1827403873791691776" {
+                    return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+                }
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+        let resB = await orchB.checkIn(account: webOnlyAccount, ticket: opaqueTicket)
+        XCTAssertEqual(resB.state, .success)
+        XCTAssertEqual(resB.strategyId, "LESSON_DESKTOP")
+        XCTAssertEqual(discoverCallsB.get(), 0)
+
+        // 3) 若账号同时持有过期 Bearer 与有效 Web Cookie，且 x-client: app 全部拒绝，X-Client: web 下纯 Cookie 回退成功并清空过期 Bearer
+        let staleDualAccount = Account(
+            id: "acc-stale-dual-web",
+            label: "双载体旧Bearer账号",
+            host: "www.yuketang.cn",
+            scheme: "https",
+            bearer: "stale-short-jwt",
+            sessionId: "web-sid-valid-002",
+            csrfToken: "web-csrf-valid-002",
+            enabled: true
+        )
+        let orchC = makeOrchestrator(profile: profile) { request in
+            let path = request.url?.path ?? ""
+            let xClient = MockNetworkSupport.headerValue("x-client", in: request)
+            let auth = MockNetworkSupport.headerValue("Authorization", in: request)
+            if path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}"#)
+            }
+            if path == "/api/v3/lesson/checkin" {
+                if xClient?.caseInsensitiveCompare("web") == .orderedSame && auth == nil {
+                    return .json(200, #"{"code":0,"msg":"签到成功"}"#)
+                }
+                return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+            }
+            return .json(404, #"{"code":40400}"#)
+        }
+        let resC = await orchC.checkIn(account: staleDualAccount, ticket: opaqueTicket)
+        XCTAssertEqual(resC.state, .success)
+        XCTAssertEqual(resC.strategyId, CheckInOrchestrator.appScanWebStrategyId)
+        XCTAssertNil(resC.refreshedAccount?.bearer, "X-Client: web 纯 Cookie 恢复成功后应清空过期 Bearer")
+        XCTAssertEqual(resC.refreshedAccount?.sessionId, "web-sid-valid-002")
+
+        // 4) 真正过期的账号在 x-client: app 与 X-Client: web 均返回 50000 UNAUTHENTICATED 时，仍准确收敛为 .authExpired
+        let orchD = makeOrchestrator(profile: profile) { request in
+            if request.url?.path == "/api/v3/app/scan" {
+                return .json(200, #"{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}"#)
+            }
+            return .json(200, #"{"code":50000,"msg":"UNAUTHENTICATED","data":""}"#)
+        }
+        let resD = await orchD.checkIn(account: webOnlyAccount, ticket: opaqueTicket)
+        XCTAssertEqual(resD.state, .authExpired)
+        XCTAssertEqual(resD.businessCode, 50000)
+    }
 }

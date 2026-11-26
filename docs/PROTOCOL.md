@@ -99,7 +99,9 @@ RainCheck 默认采用雨课堂官方 Web 端请求头集合（配置于 `protoc
 | `Cookie` | `sessionid=<sid>; csrftoken=<csrf>` | `sessionid=<sid>; csrftoken=<csrf>` | IPA `PersistCookieJar` 实证 |
 | `X-CSRFToken` | `<csrf>` | `<csrf>` | IPA 实证从 `Set-Cookie: csrftoken` 提取 |
 
-> **IPA 1.3.6 原生 App 附加头（ARM64 `func #35482` / `#50101` / `#50105` / `#50106` 实证）**：官方 iOS App 还会附带 `User-Agent: iPhone OS`、`xtua: client=app&tag=<...>&platform=iOS`、`X-UID: <uid>` 及设备信息头（`brand`、`systemVersion`、`isPhysicalDevice`、`uuid`、`incremental`、`version`、`buildNumber`）；`App.framework` 中不存在 `Origin` 或 `xt-agent`，`classroom-id` 仅附加于班级维度的接口，**不附加于** `/api/v3/app/scan` 或 `/api/v3/lesson/checkin`。
+> **IPA 1.3.6 原生 App 附加头（ARM64 `func #35482` / `#50101` / `#50105` / `#50106` 实证）**：官方 iOS App 还会附带 `User-Agent: iPhone OS`、`xtua: client=app&tag=<...>&platform=iOS`、`X-UID: <uid>`、与 Cookie 同步的 `sessionid: <sid>` / `x-csrftoken: <csrf>` 请求头及设备信息头（`brand`、`systemVersion`、`isPhysicalDevice`、`uuid`、`incremental`、`version`、`buildNumber`）；`App.framework` 中不存在 `Origin` 或 `xt-agent`，`classroom-id` 仅附加于班级维度的接口，**不附加于** `/api/v3/app/scan` 或 `/api/v3/lesson/checkin`。
+>
+> **实网实证（`www.yuketang.cn` `x-client: app` 与 Web `sessionid` 兼容回退）**：实测 `POST /api/v3/app/scan` 强依赖 `x-client: app`（`X-Client: web` 返回 HTTP 400）且不校验用户登录态；但第二步 `POST /api/v3/lesson/checkin` 在 `x-client: app` 下遇到经由 Web 登录/导入的 `sessionid` 凭据时会返回 `HTTP 200 {"code":50000,"msg":"UNAUTHENTICATED","data":""}`（此时 `X-Client: web` 的 `/api/v3/user/basic-info` 凭据校验仍有效）。RainCheck 在 `x-client: app` 模式下除同步附加 `X-UID` 与 `sessionid` 请求头外，当第二步返回 `UNAUTHENTICATED` / `401` 时，自动切回 `X-Client: web`（`APP_SCAN_CHECKIN_WEB`）重试同载荷，并允许继续复用第一步已解析的 `lessonId` 进入 `DYN_TICKET_*` / `LESSON_DESKTOP`（`source=1`，与雨课堂 Web 全屏课堂 `fullscreen.js` 一致）兜底链，避免将有效 Web 会话误判为登录过期。
 
 - **双载体鉴权（IPA 实证）**：同时支持 `Authorization: Bearer` 与 `Cookie: sessionid` + `X-CSRFToken`，任一有效即可发起业务请求。
 - **会话刷新回填（IPA 实证）**：响应头出现 `Set-Auth` / `Authorization` 或 `Set-Cookie` 时自动回填并更新当前会话（`set-auth` 优先级高于 `authorization`；忽略空值或 `Max-Age=0` 的清 Cookie 响应头；失败响应不刷 `lastOkAt`）。

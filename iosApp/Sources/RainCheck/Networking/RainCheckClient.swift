@@ -600,10 +600,16 @@ final class RainCheckClient: Sendable {
             request.setValue(headerValue, forHTTPHeaderField: headerKey)
         }
 
-        if isAppClientOverride,
-           let uid = account?.userId?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !uid.isEmpty {
-            request.setValue(uid, forHTTPHeaderField: "X-UID")
+        if isAppClientOverride {
+            if let uid = account?.userId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !uid.isEmpty {
+                request.setValue(uid, forHTTPHeaderField: "X-UID")
+            }
+            // IPA 1.3.6 func #50105 实证：官方 App 在 x-client: app 模式下会同步将 sessionid 写入请求头
+            if let sid = account?.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sid.isEmpty {
+                request.setValue(sid, forHTTPHeaderField: "sessionid")
+            }
         }
 
         if let body {

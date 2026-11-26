@@ -212,7 +212,8 @@ class SignInEngine(
                     accountId = currentRef.account.id,
                     label = currentRef.account.label,
                     state = SignState.NO_CONTEXT,
-                    message = bestFailure?.first?.message?.takeIf { it.isNotBlank() } ?: fail.message,
+                    message = bestFailure?.takeIf { it.second != SignState.AUTH_REQUIRED }
+                        ?.first?.message?.takeIf { it.isNotBlank() } ?: fail.message,
                     attempts = attempts + listOfNotNull(fail.attempt),
                 )
                 else -> SignResult(
@@ -471,16 +472,10 @@ class SignInEngine(
                 matchesAnyKeyword(scanMsg, profile.result.authKeywords))
         ) {
             attempts += scanAttempt
-            return AppScanOutcome.Terminal(
-                SignResult(
-                    accountId = currentRef.account.id,
-                    label = currentRef.account.label,
-                    state = SignState.AUTH_REQUIRED,
-                    message = scanMsg.ifBlank { "扫码鉴权失败 (HTTP ${scanRes.httpStatus})" },
-                    strategy = APP_SCAN_STRATEGY_ID,
-                    lessonId = ticket.lessonId,
-                    attempts = attempts,
-                ),
+            // x-client: app 扫码鉴权失败不直接误杀 Web 会话账号，交由后续 X-Client: web 发现与策略链验证
+            return AppScanOutcome.Fallthrough(
+                discoveredContext = null,
+                bestFailure = scanAttempt to SignState.AUTH_REQUIRED,
             )
         }
 
@@ -532,30 +527,19 @@ class SignInEngine(
                 )
                 val checkinReqBody = checkinEndpoint.body?.let { Template.renderBody(it, checkinVars) }
 
-                val checkinRes = api.call(
-                    account = currentRef.account,
-                    endpointName = "checkinAppScan",
-                    vars = checkinVars,
+                val (step2Attempt, step2State) = executeAppScanCheckinStep(
+                    currentRef = currentRef,
+                    checkinEndpoint = checkinEndpoint,
+                    checkinVars = checkinVars,
+                    checkinUrl = checkinUrl,
+                    checkinReqBody = checkinReqBody,
+                    strategyId = APP_SCAN_STRATEGY_ID,
+                    referer = null,
+                    extraHeaders = emptyMap(),
+                    attempts = attempts,
                 )
-                val checkinMsg = resolveAttemptMessage(checkinRes)
-                val rawCheckinAttempt = StrategyAttempt(
-                    strategy = APP_SCAN_STRATEGY_ID,
-                    httpStatus = checkinRes.httpStatus,
-                    code = checkinRes.code,
-                    message = checkinMsg,
-                    ok = checkinRes.ok,
-                    requestLine = "${checkinEndpoint.method} $checkinUrl",
-                    requestBody = checkinReqBody?.toString(),
-                    responseBody = checkinRes.body.take(2000),
-                    elapsedMs = checkinRes.elapsedMs,
-                )
-                val step2State = classify(rawCheckinAttempt)
-                val step2Ok = step2State == SignState.SUCCESS || step2State == SignState.ALREADY
-                val step2Attempt = rawCheckinAttempt.copy(ok = step2Ok)
-                attempts += step2Attempt
-                applyAuthUpdateIfChanged(currentRef, checkinRes.auth, markOk = step2Ok)
 
-                if (step2Ok) {
+                if (step2State == SignState.SUCCESS || step2State == SignState.ALREADY) {
                     val defaultMsg = if (step2State == SignState.ALREADY) "已签到" else "签到成功"
                     return AppScanOutcome.Terminal(
                         SignResult(
@@ -569,27 +553,56 @@ class SignInEngine(
                         ),
                     )
                 }
+
+                var effectiveAttempt = step2Attempt
+                var effectiveState = step2State
+                var effectiveStrategy = APP_SCAN_STRATEGY_ID
+
                 if (step2State == SignState.AUTH_REQUIRED) {
-                    return AppScanOutcome.Terminal(
-                        SignResult(
-                            accountId = currentRef.account.id,
-                            label = currentRef.account.label,
-                            state = SignState.AUTH_REQUIRED,
-                            message = step2Attempt.message?.takeIf { it.isNotBlank() } ?: "签到鉴权失败",
-                            strategy = APP_SCAN_STRATEGY_ID,
-                            lessonId = scanValue,
-                            attempts = attempts,
-                        ),
+                    // 实网修复：Web sessionid 账号在 x-client: app 下可能收到 code 50000 UNAUTHENTICATED，
+                    // 立即切回 X-Client: web 重试同载荷；若仍未通过则继续复用已发现的 lessonId 走 Web 兜底策略链。
+                    val webReferer = scanClassroomId?.takeIf { it.isNotBlank() }
+                        ?.let { "$checkinBase/v2/web/studentLog/$it" }
+                        ?: "$checkinBase/v2/web/index"
+                    val (webAttempt, webState) = executeAppScanCheckinStep(
+                        currentRef = currentRef,
+                        checkinEndpoint = checkinEndpoint,
+                        checkinVars = checkinVars,
+                        checkinUrl = checkinUrl,
+                        checkinReqBody = checkinReqBody,
+                        strategyId = APP_SCAN_WEB_STRATEGY_ID,
+                        referer = webReferer,
+                        extraHeaders = mapOf("X-Client" to "web"),
+                        attempts = attempts,
                     )
+                    effectiveAttempt = webAttempt
+                    effectiveState = webState
+                    effectiveStrategy = APP_SCAN_WEB_STRATEGY_ID
+
+                    if (webState == SignState.SUCCESS || webState == SignState.ALREADY) {
+                        val defaultMsg = if (webState == SignState.ALREADY) "已签到" else "签到成功"
+                        return AppScanOutcome.Terminal(
+                            SignResult(
+                                accountId = currentRef.account.id,
+                                label = currentRef.account.label,
+                                state = webState,
+                                message = webAttempt.message?.takeIf { it.isNotBlank() } ?: defaultMsg,
+                                strategy = APP_SCAN_WEB_STRATEGY_ID,
+                                lessonId = scanValue,
+                                attempts = attempts,
+                            ),
+                        )
+                    }
                 }
-                if (step2State == SignState.TICKET_EXPIRED && options.stopWhenTicketExpired) {
+
+                if (effectiveState == SignState.TICKET_EXPIRED && options.stopWhenTicketExpired) {
                     return AppScanOutcome.Terminal(
                         SignResult(
                             accountId = currentRef.account.id,
                             label = currentRef.account.label,
                             state = SignState.TICKET_EXPIRED,
-                            message = step2Attempt.message?.takeIf { it.isNotBlank() } ?: "二维码已过期",
-                            strategy = APP_SCAN_STRATEGY_ID,
+                            message = effectiveAttempt.message?.takeIf { it.isNotBlank() } ?: "二维码已过期",
+                            strategy = effectiveStrategy,
                             lessonId = scanValue,
                             attempts = attempts,
                         ),
@@ -597,7 +610,7 @@ class SignInEngine(
                 }
                 return AppScanOutcome.Fallthrough(
                     discoveredContext = discoveredContext,
-                    bestFailure = step2Attempt to step2State,
+                    bestFailure = effectiveAttempt to effectiveState,
                 )
             }
         }
@@ -628,6 +641,84 @@ class SignInEngine(
         // HTTP 404/405/5xx、网络异常或旧模拟服务未实现 /api/v3/app/scan：记录轨迹并安全回退
         attempts += scanAttempt
         return AppScanOutcome.Fallthrough(discoveredContext = null, bestFailure = null)
+    }
+
+    private suspend fun executeAppScanCheckinStep(
+        currentRef: AccountRef,
+        checkinEndpoint: EndpointSpec,
+        checkinVars: Map<String, JsonElement>,
+        checkinUrl: String,
+        checkinReqBody: JsonObject?,
+        strategyId: String,
+        referer: String?,
+        extraHeaders: Map<String, String>,
+        attempts: MutableList<StrategyAttempt>,
+    ): Pair<StrategyAttempt, SignState> {
+        val initialRes = api.call(
+            account = currentRef.account,
+            endpointName = "checkinAppScan",
+            vars = checkinVars,
+            referer = referer,
+            extraHeaders = extraHeaders,
+        )
+        val initialRawAttempt = StrategyAttempt(
+            strategy = strategyId,
+            httpStatus = initialRes.httpStatus,
+            code = initialRes.code,
+            message = resolveAttemptMessage(initialRes),
+            ok = initialRes.ok,
+            requestLine = "${checkinEndpoint.method} $checkinUrl",
+            requestBody = checkinReqBody?.toString(),
+            responseBody = initialRes.body.take(2000),
+            elapsedMs = initialRes.elapsedMs,
+        )
+        val initialState = classify(initialRawAttempt)
+        val initialOk = initialState == SignState.SUCCESS || initialState == SignState.ALREADY
+        val initialAttempt = initialRawAttempt.copy(ok = initialOk)
+        attempts += initialAttempt
+
+        val hasBearer = !currentRef.account.bearer.isNullOrBlank()
+        val hasSession = !currentRef.account.sessionId.isNullOrBlank()
+        if (initialState == SignState.AUTH_REQUIRED && hasBearer && hasSession) {
+            val cookieOnlyAccount = currentRef.account.copy(bearer = null)
+            val retryRes = api.call(
+                account = cookieOnlyAccount,
+                endpointName = "checkinAppScan",
+                vars = checkinVars,
+                referer = referer,
+                extraHeaders = extraHeaders,
+            )
+            val retryRawAttempt = StrategyAttempt(
+                strategy = strategyId,
+                httpStatus = retryRes.httpStatus,
+                code = retryRes.code,
+                message = resolveAttemptMessage(retryRes),
+                ok = retryRes.ok,
+                requestLine = "${checkinEndpoint.method} $checkinUrl",
+                requestBody = checkinReqBody?.toString(),
+                responseBody = retryRes.body.take(2000),
+                elapsedMs = retryRes.elapsedMs,
+            )
+            val retryState = classify(retryRawAttempt)
+            val retryOk = retryState == SignState.SUCCESS || retryState == SignState.ALREADY
+            val retryAttempt = retryRawAttempt.copy(ok = retryOk)
+            attempts += retryAttempt
+
+            val cookieAccepted = retryOk ||
+                (retryRes.httpStatus in 200..299 && retryState != SignState.AUTH_REQUIRED && retryState != SignState.ERROR)
+            if (cookieAccepted) {
+                val refreshed = retryRes.auth?.applyTo(cookieOnlyAccount, markOk = retryOk)
+                    ?: if (retryOk) cookieOnlyAccount.copy(lastOkAt = nowMillis()) else cookieOnlyAccount
+                currentRef.account = refreshed
+                updateMutex.withLock {
+                    onAccountUpdated(refreshed)
+                }
+            }
+            return retryAttempt to retryState
+        }
+
+        applyAuthUpdateIfChanged(currentRef, initialRes.auth, markOk = initialOk)
+        return initialAttempt to initialState
     }
 
     // ---------------------------------------------------------------- 单策略执行
@@ -913,6 +1004,7 @@ class SignInEngine(
         if (msg.isBlank() || isHtmlBody(msg) || msg.startsWith("服务器返回 HTML")) return 3
         var score = 4
         if (attempt.code != null) score += 2
+        if (classify(attempt) == SignState.AUTH_REQUIRED) score += 2
         if (attempt.code in OFFICIAL_NON_AUTH_CODES) score += 3
         return score
     }
@@ -1018,6 +1110,7 @@ class SignInEngine(
 
     private companion object {
         const val APP_SCAN_STRATEGY_ID = "APP_SCAN_CHECKIN"
+        const val APP_SCAN_WEB_STRATEGY_ID = "APP_SCAN_CHECKIN_WEB"
         val OFFICIAL_NON_AUTH_CODES = setOf(51203, 50070, 50019, 50015, 50017, 50004, 50021, 50023, 50003)
         val APP_SCAN_EXPIRED_KEYWORDS = listOf("过期", "失效", "expired", "refused", "二维码已")
     }

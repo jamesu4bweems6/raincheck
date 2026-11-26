@@ -91,9 +91,13 @@ class RainCheckApi(
         val query = Template.renderMap(endpoint.query, vars)
         val url = buildUrl(base, path, query)
         val body = endpoint.body?.let { Template.renderBody(it, vars) }
-        val mergedHeaders = buildMap {
-            endpoint.headers.forEach { (k, v) -> put(k, Template.render(v, vars)) }
-            extraHeaders.forEach { (k, v) -> put(k, v) }
+        val mergedHeaders = linkedMapOf<String, String>()
+        endpoint.headers.forEach { (k, v) -> mergedHeaders[k] = Template.render(v, vars) }
+        extraHeaders.forEach { (k, v) ->
+            // 大小写不敏感去重覆盖 endpoint.headers（如 X-Client: web 覆盖 x-client: app）
+            val existingKeys = mergedHeaders.keys.filter { it.equals(k, ignoreCase = true) }
+            existingKeys.forEach { mergedHeaders.remove(it) }
+            mergedHeaders[k] = v
         }
         return execute(
             account = if (endpoint.auth) account else null,
@@ -205,6 +209,7 @@ class RainCheckApi(
                 }
                 if (account != null) applyAuth(this, account)
                 referer?.takeIf { it.isNotBlank() }?.let { setUniqueHeader(HttpHeaders.Referrer, it) }
+                var isAppClientOverride = false
                 extraHeaders.forEach { (k, v) ->
                     if (body != null && k.equals(HttpHeaders.ContentType, ignoreCase = true)) return@forEach
                     if (k.equals("desktop-v", ignoreCase = true)) return@forEach
@@ -216,7 +221,9 @@ class RainCheckApi(
                             } else {
                                 trimmed
                             }
+                            isAppClientOverride = normalizedClient.equals("app", ignoreCase = true)
                             headers.remove("X-Client")
+                            headers.remove("x-client")
                             setUniqueHeader(k, normalizedClient)
                         }
                         k.equals(HttpHeaders.Origin, ignoreCase = true) && trimmed.startsWith("file://", ignoreCase = true) -> {
@@ -224,6 +231,11 @@ class RainCheckApi(
                         }
                         else -> setUniqueHeader(k, v)
                     }
+                }
+                if (isAppClientOverride && account != null) {
+                    account.userId?.trim()?.takeIf { it.isNotEmpty() }?.let { setUniqueHeader("X-UID", it) }
+                    // IPA 1.3.6 func #50105 实证：官方 App 在 x-client: app 模式下会同步将 sessionid 写入请求头
+                    account.sessionId?.trim()?.takeIf { it.isNotEmpty() }?.let { setUniqueHeader("sessionid", it) }
                 }
                 if (body != null) {
                     headers.remove(HttpHeaders.ContentType)

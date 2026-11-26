@@ -457,4 +457,112 @@ class SignInEngineTest {
         assertFailsWith<IllegalArgumentException> { SignOptions(maxAttemptsPerStrategy = 0) }
         assertFailsWith<IllegalArgumentException> { SignOptions(baseBackoffMs = -1) }
     }
+
+    @Test
+    fun `APP_SCAN_CHECKIN 在 x-client app 返回 50000 UNAUTHENTICATED 时自动切回 X-Client web 重试并复用 lessonId 兜底`() = runTest {
+        val rawQr = "https://www.yuketang.cn/v/index/qr?c=live1&t=1763900000&s=sig1"
+        val webCookieAccount = Account(
+            id = "web-1",
+            label = "Web手机登录账号",
+            host = "www.yuketang.cn",
+            scheme = "https",
+            bearer = null,
+            sessionId = "web-sid-123",
+            csrfToken = "web-csrf-456",
+            userId = "98765",
+        )
+
+        // 场景 A：Step 1 (x-client: app) 成功返回 lessonId；Step 2a (x-client: app) 返回 50000 UNAUTHENTICATED；
+        // Step 2b 自动切回 X-Client: web 重试 source=21 成功，零 discover 调用且校验 app/web 请求头隔离
+        data class CapturedReq(
+            val path: String,
+            val xClient: String?,
+            val sessionHeader: String?,
+            val xUid: String?,
+            val cookie: String?,
+            val body: String,
+        )
+        val seenA = mutableListOf<CapturedReq>()
+        var discoverCallsA = 0
+        val engineA = mock { request ->
+            val path = request.url.encodedPath
+            val xClient = request.headers["x-client"] ?: request.headers["X-Client"]
+            seenA += CapturedReq(
+                path = path,
+                xClient = xClient,
+                sessionHeader = request.headers["sessionid"],
+                xUid = request.headers["X-UID"],
+                cookie = request.headers[HttpHeaders.Cookie],
+                body = bodyOf(request),
+            )
+            when {
+                path == "/api/v3/classroom/on-lesson-upcoming-exam" -> {
+                    discoverCallsA++
+                    MockReply(200, """{"code":0,"data":{"onLessonClassrooms":[]}}""")
+                }
+                path == "/api/v3/app/scan" ->
+                    MockReply(200, """{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}""")
+                path == "/api/v3/lesson/checkin" && xClient.equals("app", ignoreCase = true) ->
+                    MockReply(200, """{"code":50000,"msg":"UNAUTHENTICATED","data":""}""")
+                path == "/api/v3/lesson/checkin" && xClient.equals("web", ignoreCase = true) ->
+                    MockReply(200, """{"code":0,"msg":"签到成功","data":{"lessonId":"1827403873791691776"}}""")
+                else -> MockReply(404, """{"code":40400}""")
+            }
+        }
+        val resA = SignInEngine(api(engineA), profile).signIn(webCookieAccount, QrParser.parse(rawQr, profile))
+        assertEquals(SignState.SUCCESS, resA.state)
+        assertEquals("APP_SCAN_CHECKIN_WEB", resA.strategy)
+        assertEquals("1827403873791691776", resA.lessonId)
+        assertEquals(0, discoverCallsA, "Step 1 已取得 lessonId，不得发起 discover 请求")
+        assertEquals(3, seenA.size)
+        assertEquals("app", seenA[0].xClient)
+        assertEquals("web-sid-123", seenA[0].sessionHeader, "x-client: app 应同步携带 sessionid 请求头")
+        assertEquals("98765", seenA[0].xUid)
+        assertEquals("app", seenA[1].xClient)
+        assertEquals("web-sid-123", seenA[1].sessionHeader)
+        assertEquals("web", seenA[2].xClient, "Step 2 收到 50000 UNAUTHENTICATED 后应以 X-Client: web 重试")
+        assertNull(seenA[2].sessionHeader, "X-Client: web 重试不应附加 App 专用 sessionid 请求头")
+        assertNull(seenA[2].xUid, "X-Client: web 重试不应附加 App 专用 X-UID 请求头")
+        assertTrue(seenA[2].cookie?.contains("sessionid=web-sid-123") == true)
+
+        // 场景 B：Step 2b (X-Client: web, source=21) 仍返回 50000，回退到 LESSON_DESKTOP (X-Client: web, source=1) 复用 lessonId 成功
+        val unknownUrlQr = "https://www.yuketang.cn/v/index/short-ticket/opaque-token"
+        val unknownTicket = QrParser.parse(unknownUrlQr, profile)
+        assertEquals(TicketKind.UNKNOWN, unknownTicket.kind)
+        var discoverCallsB = 0
+        val engineB = mock { request ->
+            val path = request.url.encodedPath
+            val xClient = request.headers["x-client"] ?: request.headers["X-Client"]
+            val body = bodyOf(request)
+            when {
+                path == "/api/v3/classroom/on-lesson-upcoming-exam" -> {
+                    discoverCallsB++
+                    MockReply(200, """{"code":0,"data":{"onLessonClassrooms":[]}}""")
+                }
+                path == "/api/v3/app/scan" ->
+                    MockReply(200, """{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}""")
+                path == "/api/v3/lesson/checkin" && body.contains("\"source\":21") ->
+                    MockReply(200, """{"code":50000,"msg":"UNAUTHENTICATED","data":""}""")
+                path == "/api/v3/lesson/checkin" && xClient.equals("web", ignoreCase = true) && body.contains("\"source\":1") ->
+                    MockReply(200, """{"code":0,"msg":"签到成功","data":{"lessonId":"1827403873791691776"}}""")
+                else -> MockReply(404, """{"code":40400}""")
+            }
+        }
+        val resB = SignInEngine(api(engineB), profile).signIn(webCookieAccount, unknownTicket)
+        assertEquals(SignState.SUCCESS, resB.state)
+        assertEquals("LESSON_DESKTOP", resB.strategy)
+        assertEquals("1827403873791691776", resB.lessonId)
+        assertEquals(0, discoverCallsB, "回退 LESSON_DESKTOP 应复用 app/scan 发现的 lessonId")
+
+        // 场景 C：真正过期的会话在 x-client: app 与 X-Client: web 均返回 50000 UNAUTHENTICATED，最终仍准确判 AUTH_REQUIRED
+        val engineC = mock { request ->
+            when (request.url.encodedPath) {
+                "/api/v3/app/scan" ->
+                    MockReply(200, """{"code":0,"msg":"OK","data":{"flow":"normal","type":"checkin","value":"1827403873791691776"}}""")
+                else -> MockReply(200, """{"code":50000,"msg":"UNAUTHENTICATED","data":""}""")
+            }
+        }
+        val resC = SignInEngine(api(engineC), profile).signIn(webCookieAccount, unknownTicket)
+        assertEquals(SignState.AUTH_REQUIRED, resC.state)
+    }
 }
